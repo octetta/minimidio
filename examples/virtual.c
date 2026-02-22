@@ -6,7 +6,7 @@
   Build:
     macOS:   cc virtual.c -framework CoreMIDI -o virtual_in
     Windows: cl virtual.c        (returns MM_NO_BACKEND; use loopMIDI)
-    Linux:   cc virtual.c -ldl -lpthread -o virtual_in
+    Linux:   cc virtual.c -lasound -lpthread -o virtual_in
 
   Once running:
     macOS:  your app appears in every MIDI app's output port list under
@@ -30,6 +30,21 @@
 #  include <unistd.h>
 #  define mm_sleep_ms(ms) usleep((ms)*1000)
 #endif
+
+#include <signal.h>
+
+static volatile int g_running = 1;
+#ifdef _WIN32
+static BOOL WINAPI ctrl_handler(DWORD e) {
+    if (e == CTRL_C_EVENT || e == CTRL_BREAK_EVENT) { g_running = 0; return TRUE; }
+    return FALSE;
+}
+static void setup_ctrl_c(void) { SetConsoleCtrlHandler(ctrl_handler, TRUE); }
+#else
+static void sig_handler(int s) { (void)s; g_running = 0; }
+static void setup_ctrl_c(void) { signal(SIGINT, sig_handler); signal(SIGTERM, sig_handler); }
+#endif
+
 
 static void on_midi(mm_device* dev, const mm_message* msg, void* ud) {
     (void)dev; (void)ud;
@@ -71,6 +86,8 @@ static void on_midi(mm_device* dev, const mm_message* msg, void* ud) {
 }
 
 int main(void) {
+    setup_ctrl_c();
+
     mm_context ctx;
     mm_result r = mm_context_init(&ctx, "my-synth");
     if (r != MM_SUCCESS) {
@@ -111,7 +128,8 @@ int main(void) {
     printf("        or use qjackctl / Carla patchbay\n\n");
     printf("Waiting for MIDI... (Ctrl-C to quit)\n\n");
 
-    while (1) mm_sleep_ms(100);
+    while (g_running) mm_sleep_ms(100);
+    printf("\nStopping...\n");
 
     mm_in_stop(&dev);
     mm_in_close(&dev);

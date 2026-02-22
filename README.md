@@ -8,17 +8,20 @@
 #include "minimidio.h"
 ```
 
-Zero external dependencies. Everything goes through OS libraries already on the target machine.
+One file to copy into your project. OS MIDI libraries are the only dependencies —
+all present by default on macOS and Windows. On Linux you need `libasound2-dev`
+for headers at build time and `libasound2` at runtime (standard on any ALSA system).
 
 ---
 
 ## Platform backends
 
-| Platform | Backend | Library |
-|----------|---------|---------|
-| macOS / iOS | CoreMIDI | `CoreMIDI.framework` (always present) |
-| Windows | WinMM | `winmm.dll` (always present) |
-| Linux | ALSA sequencer | `libasound.so.2` — dlopen'd at runtime, zero link dependency |
+| Platform | Backend | Link flag |
+|----------|---------|-----------|
+| macOS / iOS | CoreMIDI | `-framework CoreMIDI` |
+| Windows (MSVC) | WinMM | automatic via `#pragma comment(lib, "winmm.lib")` |
+| Windows (MinGW / Clang) | WinMM | `-lwinmm` |
+| Linux | ALSA sequencer | `-lasound -lpthread` |
 
 ---
 
@@ -28,14 +31,17 @@ Zero external dependencies. Everything goes through OS libraries already on the 
 # macOS
 cc my_app.c -framework CoreMIDI -o my_app
 
-# Windows (MSVC) — winmm.lib pulled in automatically via #pragma
+# Windows (MSVC) — winmm.lib linked automatically
 cl my_app.c
 
-# Windows (MinGW / Clang)
+# Windows (MinGW / Clang / Zig)
 cc my_app.c -lwinmm -o my_app
+zig cc my_app.c -target x86_64-windows-gnu -lwinmm -o my_app.exe
 
-# Linux — only -ldl -lpthread required; libasound loaded at runtime
-cc my_app.c -ldl -lpthread -o my_app
+# Linux — requires libasound2-dev (headers) and libasound2 (runtime)
+#   Ubuntu/Debian: sudo apt install libasound2-dev
+#   Fedora/RHEL:   sudo dnf install alsa-lib-devel
+cc my_app.c -lasound -lpthread -o my_app
 ```
 
 ---
@@ -446,6 +452,22 @@ the callback thread.
 ---
 
 ## Changelog
+
+### v0.4.1 — bug fixes, no API changes
+- **ALSA: switched from dlopen to `-lasound`**. All ALSA sequencer functions are
+  inline wrappers in `<alsa/asoundlib.h>` and are not exported from `libasound.so`,
+  making runtime symbol loading unworkable. Build now requires `-lasound -lpthread`
+  and `libasound2-dev` headers (`apt install libasound2-dev` / `dnf install alsa-lib-devel`).
+- **ALSA: fixed crash in port enumeration**. `snd_seq_client_info_malloc` and
+  `snd_seq_port_info_malloc` are also inline-only. Replaced with
+  `snd_seq_client_info_alloca` / `snd_seq_port_info_alloca` (stack allocation).
+- **ALSA: fixed virtual port receive** — events from external subscribers were
+  never delivered because `snd_seq_event_input_pending` was called with
+  `fetch_sequencer=0`. Changed to `1` so the kernel ring is drained correctly.
+- **ALSA: fixed compile error** — `snd_seq_ev_set_noteon` and related names are
+  macros in `<alsa/seq_event.h>`. Using them as struct field names caused
+  preprocessor expansion errors. All such calls are now made directly as the
+  inline functions they are.
 
 ### v0.4.0
 - `mm_in_open_virtual(ctx, dev, cb, ud)` — create a virtual MIDI destination.

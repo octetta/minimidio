@@ -5,7 +5,7 @@
   Build:
     macOS:   cc daw_sync.c -framework CoreMIDI -o daw_sync
     Windows: cl daw_sync.c
-    Linux:   cc daw_sync.c -ldl -lpthread -o daw_sync
+    Linux:   cc daw_sync.c -lasound -lpthread -o daw_sync
 
   Usage:
     ./daw_sync             -- opens input[0]
@@ -38,6 +38,21 @@
 #  include <unistd.h>
 #  define mm_sleep_ms(ms) usleep((ms)*1000)
 #endif
+
+#include <signal.h>
+
+static volatile int g_running = 1;
+#ifdef _WIN32
+static BOOL WINAPI ctrl_handler(DWORD e) {
+    if (e == CTRL_C_EVENT || e == CTRL_BREAK_EVENT) { g_running = 0; return TRUE; }
+    return FALSE;
+}
+static void setup_ctrl_c(void) { SetConsoleCtrlHandler(ctrl_handler, TRUE); }
+#else
+static void sig_handler(int s) { (void)s; g_running = 0; }
+static void setup_ctrl_c(void) { signal(SIGINT, sig_handler); signal(SIGTERM, sig_handler); }
+#endif
+
 
 /* ── Transport state ─────────────────────────────────────────────────────── */
 
@@ -152,6 +167,8 @@ int main(int argc, char* argv[]) {
     uint32_t port_idx = 0;
     if (argc > 1) port_idx = (uint32_t)atoi(argv[1]);
 
+    setup_ctrl_c();
+
     mm_context ctx;
     mm_result  r = mm_context_init(&ctx, "daw-sync");
     if (r != MM_SUCCESS) {
@@ -207,7 +224,8 @@ int main(int argc, char* argv[]) {
            ctx.name);
     printf("Handles: CLOCK  START  STOP  CONTINUE  SONG-POSITION  MTC  RESET\n\n");
 
-    while (1) mm_sleep_ms(100);
+    while (g_running) mm_sleep_ms(100);
+    printf("\nStopping...\n");
 
     mm_in_stop(&dev);
     mm_in_close(&dev);

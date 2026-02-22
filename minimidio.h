@@ -1,5 +1,27 @@
 /*
-minimidio.h - v0.4.0 - Single-file cross-platform MIDI input/output library
+minimidio.h - v0.4.1 - Single-file cross-platform MIDI input/output library
+
+CHANGES v0.4.1
+  Bug fixes — no API changes.
+
+  ALSA:
+    - Dropped dlopen/dlsym approach. All ALSA sequencer functions are inline
+      wrappers in <alsa/asoundlib.h> and are not exported from libasound.so,
+      so runtime symbol loading was never viable. The backend now links
+      directly: compile with -lasound -lpthread.
+      Install headers with: apt install libasound2-dev  (or dnf install alsa-lib-devel)
+    - Fixed crash in port enumeration (mm_out_count, mm_in_count, mm_in_open,
+      mm_out_open): snd_seq_client_info_malloc and snd_seq_port_info_malloc are
+      also inline-only. Replaced with snd_seq_client_info_alloca /
+      snd_seq_port_info_alloca (stack allocation) and the corresponding inline
+      set/get calls. No heap allocation in enumeration.
+    - Fixed virtual port receive: snd_seq_event_input_pending() was called with
+      fetch_sequencer=0, so events from external subscribers sat in the kernel
+      ring and were never drained. Changed to fetch_sequencer=1.
+    - Fixed ALSA name-collision bug: struct fields and call sites for
+      snd_seq_ev_set_noteon, snd_seq_ev_set_direct, etc. conflicted with macros
+      of the same name defined in <alsa/seq_event.h>, producing compile errors.
+      These are now called directly as inline functions (no struct field needed).
 
 CHANGES v0.4.0
   Virtual port support — other apps (VMPK, DAWs, Pure Data, etc.) can now
@@ -62,8 +84,7 @@ CHANGES v0.2.0
   ALSA FIXES:
     - Replaced usleep(500) busy-loop with poll() on sequencer file
       descriptors + a wakeup pipe → zero added latency on clock ticks.
-    - Added snd_seq_poll_descriptors_count / snd_seq_poll_descriptors to the
-      dlopen load list.
+    - Added snd_seq_poll_descriptors_count / snd_seq_poll_descriptors.
     - Port enumeration now accepts ports with only SND_SEQ_PORT_CAP_READ
       (no SUBS_READ) so DAW clock-only ports are visible.
     - SND_SEQ_EVENT_SONGPOS, SND_SEQ_EVENT_QFRAME, SND_SEQ_EVENT_SONGSEL,
@@ -89,7 +110,7 @@ ABOUT
   Platform backends:
     macOS / iOS  : CoreMIDI   (CoreMIDI.framework  — always present)
     Windows      : WinMM      (winmm.dll            — always present)
-    Linux        : ALSA seq   (libasound.so.2       — dlopen'd at runtime)
+    Linux        : ALSA seq   (libasound            — link with -lasound)
 
 LICENSE
   MIT — see end of file.
@@ -386,53 +407,17 @@ typedef struct {
 } mm__dev_winmm;
 
 #elif defined(MM_BACKEND_ALSA)
-#  include <dlfcn.h>
 #  include <alsa/asoundlib.h>
 #  include <pthread.h>
 #  include <poll.h>
 
+/* ALSA sequencer API: all functions are inline wrappers in <alsa/asoundlib.h>
+   over internal primitives — none are directly dlsym-able.
+   We link -lasound directly, the same way macOS links -framework CoreMIDI.   */
+
 typedef struct mm__ctx_alsa {
-    void*      lib;
     snd_seq_t* seq;
     int        client_id;
-
-    /* ── hard-required symbols ── */
-    int  (*fn_snd_seq_open)(snd_seq_t**, const char*, int, int);
-    int  (*fn_snd_seq_close)(snd_seq_t*);
-    int  (*fn_snd_seq_set_client_name)(snd_seq_t*, const char*);
-    int  (*fn_snd_seq_create_simple_port)(snd_seq_t*, const char*, unsigned int, unsigned int);
-    int  (*fn_snd_seq_delete_port)(snd_seq_t*, int);
-    int  (*fn_snd_seq_client_id)(snd_seq_t*);
-    int  (*fn_snd_seq_connect_from)(snd_seq_t*, int, int, int);
-    int  (*fn_snd_seq_connect_to)(snd_seq_t*, int, int, int);
-    int  (*fn_snd_seq_disconnect_from)(snd_seq_t*, int, int, int);
-    int  (*fn_snd_seq_disconnect_to)(snd_seq_t*, int, int, int);
-    int  (*fn_snd_seq_event_input)(snd_seq_t*, snd_seq_event_t**);
-    int  (*fn_snd_seq_event_input_pending)(snd_seq_t*, int);
-    int  (*fn_snd_seq_drain_output)(snd_seq_t*);
-    /* poll descriptors — zero-latency clock receive */
-    int  (*fn_snd_seq_poll_descriptors_count)(snd_seq_t*, short);
-    int  (*fn_snd_seq_poll_descriptors)(snd_seq_t*, struct pollfd*, unsigned int, short);
-    /* client info */
-    void*       (*fn_snd_seq_client_info_malloc)(void);
-    void        (*fn_snd_seq_client_info_free)(snd_seq_client_info_t*);
-    void        (*fn_snd_seq_client_info_set_client)(snd_seq_client_info_t*, int);
-    int         (*fn_snd_seq_client_info_get_client)(snd_seq_client_info_t*);
-    const char* (*fn_snd_seq_client_info_get_name)(snd_seq_client_info_t*);
-    int         (*fn_snd_seq_query_next_client)(snd_seq_t*, snd_seq_client_info_t*);
-    /* port info */
-    void*        (*fn_snd_seq_port_info_malloc)(void);
-    void         (*fn_snd_seq_port_info_free)(snd_seq_port_info_t*);
-    void         (*fn_snd_seq_port_info_set_client)(snd_seq_port_info_t*, int);
-    void         (*fn_snd_seq_port_info_set_port)(snd_seq_port_info_t*, int);
-    int          (*fn_snd_seq_port_info_get_port)(snd_seq_port_info_t*);
-    int          (*fn_snd_seq_port_info_get_client)(snd_seq_port_info_t*);
-    unsigned int (*fn_snd_seq_port_info_get_capability)(snd_seq_port_info_t*);
-    unsigned int (*fn_snd_seq_port_info_get_type)(snd_seq_port_info_t*);
-    const char*  (*fn_snd_seq_port_info_get_name)(snd_seq_port_info_t*);
-    int          (*fn_snd_seq_query_next_port)(snd_seq_t*, snd_seq_port_info_t*);
-    /* ── optional symbol (not in all distro versions) ── */
-    int  (*fn_snd_seq_event_output)(snd_seq_t*, snd_seq_event_t*);
 } mm__ctx_alsa;
 
 typedef struct mm__dev_alsa {
@@ -1020,7 +1005,7 @@ mm_result mm_out_open_virtual(mm_context* ctx, mm_device* dev)
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   ALSA sequencer (Linux) — compile with -ldl -lpthread only
+   ALSA sequencer (Linux) — compile with -lasound -lpthread only
    ───────────────────────────────────────────────────────────────────────── */
 #elif defined(MM_BACKEND_ALSA)
 
@@ -1028,79 +1013,21 @@ mm_result mm_out_open_virtual(mm_context* ctx, mm_device* dev)
 #include <unistd.h>
 #include <errno.h>
 
-/* Hard-fail: symbol must be present */
-#define MM__ALSA_LOAD(ctx, field, sym) \
-    (ctx)->al.field = (typeof((ctx)->al.field))dlsym((ctx)->al.lib, sym); \
-    if (!(ctx)->al.field) { \
-        fprintf(stderr, "minimidio: dlsym(\"%s\") failed: %s\n", sym, dlerror()); \
-        dlclose((ctx)->al.lib); (ctx)->al.lib=NULL; return MM_NO_BACKEND; }
-
-/* Soft-fail: missing is tolerated (older distros) */
-#define MM__ALSA_LOAD_OPT(ctx, field, sym) \
-    (ctx)->al.field = (typeof((ctx)->al.field))dlsym((ctx)->al.lib, sym);
-
 mm_result mm_context_init(mm_context* ctx, const char* name) {
     if (!ctx) return MM_INVALID_ARG;
     memset(ctx, 0, sizeof(*ctx));
     strncpy(ctx->name, (name && name[0]) ? name : "minimidio", sizeof(ctx->name)-1);
-
-    ctx->al.lib = dlopen("libasound.so.2", RTLD_LAZY|RTLD_LOCAL);
-    if (!ctx->al.lib) ctx->al.lib = dlopen("libasound.so", RTLD_LAZY|RTLD_LOCAL);
-    if (!ctx->al.lib) {
-        fprintf(stderr, "minimidio: cannot open libasound: %s\n", dlerror());
-        return MM_NO_BACKEND;
-    }
-
-    MM__ALSA_LOAD(ctx, fn_snd_seq_open, "snd_seq_open")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_close, "snd_seq_close")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_set_client_name, "snd_seq_set_client_name")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_create_simple_port, "snd_seq_create_simple_port")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_delete_port, "snd_seq_delete_port")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_client_id, "snd_seq_client_id")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_connect_from, "snd_seq_connect_from")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_connect_to, "snd_seq_connect_to")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_disconnect_from, "snd_seq_disconnect_from")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_disconnect_to, "snd_seq_disconnect_to")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_event_input, "snd_seq_event_input")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_event_input_pending, "snd_seq_event_input_pending")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_drain_output, "snd_seq_drain_output")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_poll_descriptors_count, "snd_seq_poll_descriptors_count")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_poll_descriptors, "snd_seq_poll_descriptors")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_client_info_malloc, "snd_seq_client_info_malloc")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_client_info_free, "snd_seq_client_info_free")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_client_info_set_client, "snd_seq_client_info_set_client")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_client_info_get_client, "snd_seq_client_info_get_client")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_client_info_get_name, "snd_seq_client_info_get_name")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_query_next_client, "snd_seq_query_next_client")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_port_info_malloc, "snd_seq_port_info_malloc")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_port_info_free, "snd_seq_port_info_free")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_port_info_set_client, "snd_seq_port_info_set_client")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_port_info_set_port, "snd_seq_port_info_set_port")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_port_info_get_port, "snd_seq_port_info_get_port")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_port_info_get_client, "snd_seq_port_info_get_client")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_port_info_get_capability, "snd_seq_port_info_get_capability")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_port_info_get_type, "snd_seq_port_info_get_type")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_port_info_get_name, "snd_seq_port_info_get_name")
-    MM__ALSA_LOAD(ctx, fn_snd_seq_query_next_port, "snd_seq_query_next_port")
-    MM__ALSA_LOAD_OPT(ctx, fn_snd_seq_event_output, "snd_seq_event_output")  /* optional */
-
-    /* snd_seq_ev_set_* are inline static functions in the ALSA headers —
-       they are NOT exported from libasound.so and cannot be dlsym'd.
-       We implement them directly here.                                       */
-
-    if (ctx->al.fn_snd_seq_open(&ctx->al.seq, "default", SND_SEQ_OPEN_DUPLEX, 0) < 0) {
-        dlclose(ctx->al.lib); ctx->al.lib=NULL; return MM_ERROR;
-    }
-    ctx->al.fn_snd_seq_set_client_name(ctx->al.seq, ctx->name);
-    ctx->al.client_id = ctx->al.fn_snd_seq_client_id(ctx->al.seq);
+    if (snd_seq_open(&ctx->al.seq, "default", SND_SEQ_OPEN_DUPLEX, 0) < 0)
+        return MM_ERROR;
+    snd_seq_set_client_name(ctx->al.seq, ctx->name);
+    ctx->al.client_id = snd_seq_client_id(ctx->al.seq);
     ctx->initialized = 1; return MM_SUCCESS;
 }
 
 mm_result mm_context_uninit(mm_context* ctx) {
     if (!ctx||!ctx->initialized) return MM_INVALID_ARG;
-    ctx->al.fn_snd_seq_close(ctx->al.seq);
-    dlclose(ctx->al.lib); ctx->al.lib=NULL; ctx->initialized=0;
-    return MM_SUCCESS;
+    snd_seq_close(ctx->al.seq);
+    ctx->initialized = 0; return MM_SUCCESS;
 }
 
 /* ── Port enumeration ────────────────────────────────────────────────────────
@@ -1115,28 +1042,32 @@ static void mm__alsa_enum(mm_context* ctx, mm__alsa_pl* lst,
                            unsigned int cap_req, unsigned int cap_any)
 {
     mm__ctx_alsa* al = &ctx->al; lst->count = 0;
-    snd_seq_client_info_t* ci = al->fn_snd_seq_client_info_malloc();
-    snd_seq_port_info_t*   pi = al->fn_snd_seq_port_info_malloc();
-    al->fn_snd_seq_client_info_set_client(ci, -1);
-    while (al->fn_snd_seq_query_next_client(al->seq, ci) >= 0) {
-        int cid = al->fn_snd_seq_client_info_get_client(ci);
+
+    /* snd_seq_client_info_alloca / snd_seq_port_info_alloca are stack-based
+       macros in the ALSA headers — no malloc/free, no dlsym needed.         */
+    snd_seq_client_info_t* ci;
+    snd_seq_port_info_t*   pi;
+    snd_seq_client_info_alloca(&ci);
+    snd_seq_port_info_alloca(&pi);
+
+    snd_seq_client_info_set_client(ci, -1);
+    while (snd_seq_query_next_client(al->seq, ci) >= 0) {
+        int cid = snd_seq_client_info_get_client(ci);
         if (cid == al->client_id) continue;
-        al->fn_snd_seq_port_info_set_client(pi, cid);
-        al->fn_snd_seq_port_info_set_port(pi, -1);
-        while (al->fn_snd_seq_query_next_port(al->seq, pi) >= 0) {
-            unsigned int cap = al->fn_snd_seq_port_info_get_capability(pi);
+        snd_seq_port_info_set_client(pi, cid);
+        snd_seq_port_info_set_port(pi, -1);
+        while (snd_seq_query_next_port(al->seq, pi) >= 0) {
+            unsigned int cap = snd_seq_port_info_get_capability(pi);
             int ok = ((cap&cap_req)==cap_req) || (cap_any && (cap&cap_any));
             if (!ok || lst->count >= MM_MAX_PORTS) continue;
             mm__alsa_pi* p = &lst->ports[lst->count++];
             p->client = cid;
-            p->port   = al->fn_snd_seq_port_info_get_port(pi);
+            p->port   = snd_seq_port_info_get_port(pi);
             snprintf(p->name, sizeof(p->name), "%s:%s (%d:%d)",
-                     al->fn_snd_seq_client_info_get_name(ci),
-                     al->fn_snd_seq_port_info_get_name(pi), cid, p->port);
+                     snd_seq_client_info_get_name(ci),
+                     snd_seq_port_info_get_name(pi), cid, p->port);
         }
     }
-    al->fn_snd_seq_client_info_free(ci);
-    al->fn_snd_seq_port_info_free(pi);
 }
 
 uint32_t mm_in_count(mm_context* ctx) {
@@ -1182,13 +1113,13 @@ static void* mm__alsa_recv_thread(void* arg)
     mm__dev_alsa* da  = &dev->al;
 
     /* Build pollfd set: ALSA fds + wakeup pipe read end */
-    int nalsa = al->fn_snd_seq_poll_descriptors_count(al->seq, POLLIN);
+    int nalsa = snd_seq_poll_descriptors_count(al->seq, POLLIN);
     if (nalsa < 0) nalsa = 0;
     int nfds = nalsa + 1;
     struct pollfd* pfds = (struct pollfd*)malloc((size_t)nfds * sizeof(struct pollfd));
     if (!pfds) return NULL;
 
-    al->fn_snd_seq_poll_descriptors(al->seq, pfds, (unsigned)nalsa, POLLIN);
+    snd_seq_poll_descriptors(al->seq, pfds, (unsigned)nalsa, POLLIN);
     pfds[nalsa].fd     = da->wake_pipe[0];
     pfds[nalsa].events = POLLIN;
 
@@ -1201,12 +1132,12 @@ static void* mm__alsa_recv_thread(void* arg)
         }
 
         /* Drain all pending events from the kernel buffer.
-           Pass fetch_sequencer=1 to fn_snd_seq_event_input_pending so it
+           Pass fetch_sequencer=1 to snd_seq_event_input_pending so it
            actually queries the kernel — without this, virtual-port events
            sit in the kernel ring and the pending count reads as 0.          */
-        while (al->fn_snd_seq_event_input_pending(al->seq, 1) > 0) {
+        while (snd_seq_event_input_pending(al->seq, 1) > 0) {
             snd_seq_event_t* ev = NULL;
-            int rc = al->fn_snd_seq_event_input(al->seq, &ev);
+            int rc = snd_seq_event_input(al->seq, &ev);
             if (rc == -EAGAIN || rc == -ENOSPC) break; /* nothing left */
             if (rc < 0 || !ev) break;
 
@@ -1345,7 +1276,7 @@ mm_result mm_in_open(mm_context* ctx, mm_device* dev, uint32_t idx,
     if (pipe(dev->al.wake_pipe) != 0) return MM_ERROR;
 
     char portname[80]; snprintf(portname, sizeof(portname), "%s-in", ctx->name);
-    dev->al.port_id = ctx->al.fn_snd_seq_create_simple_port(ctx->al.seq, portname,
+    dev->al.port_id = snd_seq_create_simple_port(ctx->al.seq, portname,
         SND_SEQ_PORT_CAP_WRITE|SND_SEQ_PORT_CAP_SUBS_WRITE,
         SND_SEQ_PORT_TYPE_APPLICATION);
     if (dev->al.port_id < 0) {
@@ -1358,7 +1289,7 @@ mm_result mm_in_start(mm_device* dev) {
     if (!dev||!dev->is_open||!dev->is_input) return MM_NOT_OPEN;
     if (!dev->is_virtual) {
         mm__ctx_alsa* al=&dev->ctx->al;
-        al->fn_snd_seq_connect_from(al->seq, dev->al.port_id,
+        snd_seq_connect_from(al->seq, dev->al.port_id,
                                   dev->al.target_client, dev->al.target_port);
     }
     dev->al.running=1;
@@ -1373,7 +1304,7 @@ mm_result mm_in_stop(mm_device* dev) {
     pthread_join(dev->al.thread, NULL);
     if (!dev->is_virtual) {
         mm__ctx_alsa* al=&dev->ctx->al;
-        al->fn_snd_seq_disconnect_from(al->seq, dev->al.port_id,
+        snd_seq_disconnect_from(al->seq, dev->al.port_id,
                                      dev->al.target_client, dev->al.target_port);
     }
     return MM_SUCCESS;
@@ -1383,7 +1314,7 @@ mm_result mm_in_close(mm_device* dev) {
     if (!dev||!dev->is_open) return MM_NOT_OPEN;
     if (dev->al.running) mm_in_stop(dev);
     close(dev->al.wake_pipe[0]); close(dev->al.wake_pipe[1]);
-    dev->ctx->al.fn_snd_seq_delete_port(dev->ctx->al.seq, dev->al.port_id);
+    snd_seq_delete_port(dev->ctx->al.seq, dev->al.port_id);
     dev->is_open=0; return MM_SUCCESS;
 }
 
@@ -1397,11 +1328,11 @@ mm_result mm_out_open(mm_context* ctx, mm_device* dev, uint32_t idx) {
     dev->al.target_client=lst.ports[idx].client;
     dev->al.target_port  =lst.ports[idx].port;
     char portname[80]; snprintf(portname, sizeof(portname), "%s-out", ctx->name);
-    dev->al.port_id=ctx->al.fn_snd_seq_create_simple_port(ctx->al.seq, portname,
+    dev->al.port_id=snd_seq_create_simple_port(ctx->al.seq, portname,
         SND_SEQ_PORT_CAP_READ|SND_SEQ_PORT_CAP_SUBS_READ,
         SND_SEQ_PORT_TYPE_APPLICATION);
     if (dev->al.port_id < 0) return MM_ERROR;
-    ctx->al.fn_snd_seq_connect_to(ctx->al.seq, dev->al.port_id,
+    snd_seq_connect_to(ctx->al.seq, dev->al.port_id,
                                 dev->al.target_client, dev->al.target_port);
     dev->is_open=1; return MM_SUCCESS;
 }
@@ -1413,8 +1344,8 @@ static void mm__alsa_send_ev(mm_device* dev, snd_seq_event_t* ev) {
     snd_seq_ev_set_direct(ev);
     snd_seq_ev_set_source(ev, dev->al.port_id);
     snd_seq_ev_set_subs(ev);
-    if (al->fn_snd_seq_event_output) al->fn_snd_seq_event_output(al->seq, ev);
-    al->fn_snd_seq_drain_output(al->seq);
+    snd_seq_event_output(al->seq, ev);
+    snd_seq_drain_output(al->seq);
 }
 
 mm_result mm_out_send(mm_device* dev, const mm_message* msg) {
@@ -1471,9 +1402,9 @@ mm_result mm_out_close(mm_device* dev) {
     if (!dev||!dev->is_open) return MM_NOT_OPEN;
     mm__ctx_alsa* al=&dev->ctx->al;
     if (!dev->is_virtual)
-        al->fn_snd_seq_disconnect_to(al->seq,dev->al.port_id,
+        snd_seq_disconnect_to(al->seq,dev->al.port_id,
                                    dev->al.target_client,dev->al.target_port);
-    al->fn_snd_seq_delete_port(al->seq,dev->al.port_id);
+    snd_seq_delete_port(al->seq,dev->al.port_id);
     dev->is_open=0; return MM_SUCCESS;
 }
 
@@ -1502,7 +1433,7 @@ mm_result mm_in_open_virtual(mm_context* ctx, mm_device* dev,
 
     /* Port name is just the client name — no "-in" suffix for virtual ports,
        since the client name already identifies the app uniquely.              */
-    dev->al.port_id = ctx->al.fn_snd_seq_create_simple_port(ctx->al.seq, ctx->name,
+    dev->al.port_id = snd_seq_create_simple_port(ctx->al.seq, ctx->name,
         SND_SEQ_PORT_CAP_WRITE | SND_SEQ_PORT_CAP_SUBS_WRITE,
         SND_SEQ_PORT_TYPE_APPLICATION | SND_SEQ_PORT_TYPE_MIDI_GENERIC);
     if (dev->al.port_id < 0) {
@@ -1522,7 +1453,7 @@ mm_result mm_out_open_virtual(mm_context* ctx, mm_device* dev)
     memset(dev,0,sizeof(*dev));
     dev->ctx=ctx; dev->is_input=0; dev->is_virtual=1;
 
-    dev->al.port_id = ctx->al.fn_snd_seq_create_simple_port(ctx->al.seq, ctx->name,
+    dev->al.port_id = snd_seq_create_simple_port(ctx->al.seq, ctx->name,
         SND_SEQ_PORT_CAP_READ | SND_SEQ_PORT_CAP_SUBS_READ,
         SND_SEQ_PORT_TYPE_APPLICATION | SND_SEQ_PORT_TYPE_MIDI_GENERIC);
     if (dev->al.port_id < 0) return MM_ERROR;

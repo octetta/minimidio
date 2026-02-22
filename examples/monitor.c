@@ -4,7 +4,7 @@
   Build:
     macOS:   cc monitor.c -framework CoreMIDI -o monitor
     Windows: cl monitor.c
-    Linux:   cc monitor.c -ldl -lpthread -o monitor
+    Linux:   cc monitor.c -lasound -lpthread -o monitor
 
   This process will appear to other MIDI software as "midi-monitor".
   Change the name passed to mm_context_init() to suit your application.
@@ -23,6 +23,21 @@
 #  include <unistd.h>
 #  define mm_sleep_ms(ms) usleep((ms)*1000)
 #endif
+
+#include <signal.h>
+
+static volatile int g_running = 1;
+#ifdef _WIN32
+static BOOL WINAPI ctrl_handler(DWORD e) {
+    if (e == CTRL_C_EVENT || e == CTRL_BREAK_EVENT) { g_running = 0; return TRUE; }
+    return FALSE;
+}
+static void setup_ctrl_c(void) { SetConsoleCtrlHandler(ctrl_handler, TRUE); }
+#else
+static void sig_handler(int s) { (void)s; g_running = 0; }
+static void setup_ctrl_c(void) { signal(SIGINT, sig_handler); signal(SIGTERM, sig_handler); }
+#endif
+
 
 static const char* type_name(mm_message_type t) {
     switch (t) {
@@ -88,6 +103,8 @@ int main(int argc, char* argv[]) {
     /* Optional: pass port index as first argument */
     uint32_t port_idx = 0;
     if (argc > 1) port_idx = (uint32_t)atoi(argv[1]);
+
+    setup_ctrl_c();
 
     mm_context ctx;
     mm_result r = mm_context_init(&ctx, "midi-monitor");
@@ -157,7 +174,8 @@ int main(int argc, char* argv[]) {
     printf("  timestamp   type       ch   d0  d1\n");
     printf("  ---------   ---------  --   --  --\n");
 
-    while (1) mm_sleep_ms(100);
+    while (g_running) mm_sleep_ms(100);
+    printf("\nStopping...\n");
 
     mm_in_stop(&dev);
     mm_in_close(&dev);

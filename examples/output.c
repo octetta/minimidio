@@ -4,7 +4,7 @@
   Build:
     macOS:   cc output.c -framework CoreMIDI -o output_test
     Windows: cl output.c
-    Linux:   cc output.c -ldl -lpthread -o output_test
+    Linux:   cc output.c -lasound -lpthread -o output_test
 
   Usage:
     ./output_test          -- opens output[0]

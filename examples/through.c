@@ -4,7 +4,7 @@
   Build:
     macOS:   cc through.c -framework CoreMIDI -o through
     Windows: cl through.c
-    Linux:   cc through.c -ldl -lpthread -o through
+    Linux:   cc through.c -lasound -lpthread -o through
 
   Usage:
     ./through              -- input[0] → output[0]
@@ -27,6 +27,21 @@
 #  define mm_sleep_ms(ms) usleep((ms)*1000)
 #endif
 
+#include <signal.h>
+
+static volatile int g_running = 1;
+#ifdef _WIN32
+static BOOL WINAPI ctrl_handler(DWORD e) {
+    if (e == CTRL_C_EVENT || e == CTRL_BREAK_EVENT) { g_running = 0; return TRUE; }
+    return FALSE;
+}
+static void setup_ctrl_c(void) { SetConsoleCtrlHandler(ctrl_handler, TRUE); }
+#else
+static void sig_handler(int s) { (void)s; g_running = 0; }
+static void setup_ctrl_c(void) { signal(SIGINT, sig_handler); signal(SIGTERM, sig_handler); }
+#endif
+
+
 static void on_midi(mm_device* in_dev, const mm_message* msg, void* ud) {
     mm_device* out = (mm_device*)ud;
     (void)in_dev;
@@ -43,6 +58,8 @@ int main(int argc, char* argv[]) {
     uint32_t out_idx = 0;
     if (argc > 1) in_idx  = (uint32_t)atoi(argv[1]);
     if (argc > 2) out_idx = (uint32_t)atoi(argv[2]);
+
+    setup_ctrl_c();
 
     mm_context ctx;
     mm_result r = mm_context_init(&ctx, "midi-through");
@@ -107,7 +124,8 @@ int main(int argc, char* argv[]) {
     printf("All messages forwarded (including SysEx, clock, transport).\n");
     printf("Press Ctrl-C to stop.\n");
 
-    while (1) mm_sleep_ms(100);
+    while (g_running) mm_sleep_ms(100);
+    printf("\nStopping...\n");
 
     mm_in_stop(&in);
     mm_in_close(&in);
