@@ -1,3 +1,5 @@
+<img src="logo.png" width="200">
+
 # minimidio
 
 > Single-file, cross-platform C header library for MIDI input/output.
