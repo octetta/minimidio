@@ -27,6 +27,10 @@ API through Emscripten.
 | Linux | ALSA sequencer | `-lasound -lpthread` |
 | Web / Emscripten | Web MIDI | `-sASYNCIFY` |
 
+MIDI 2.0 / UMP support is currently implemented for Linux ALSA builds with
+new enough ALSA sequencer UMP headers/runtime. Other backends keep the MIDI
+1.0 API and return `MM_NO_BACKEND` for raw UMP calls.
+
 ---
 
 ## Build
@@ -229,6 +233,7 @@ int main(void) {
    On Windows the name is stored but not advertised by WinMM.            */
 mm_result mm_context_init  (mm_context* ctx, const char* name);
 mm_result mm_context_uninit(mm_context* ctx);
+uint32_t  mm_context_caps  (mm_context* ctx);
 ```
 
 `ctx.name` is a `char[64]` field accessible after init:
@@ -236,6 +241,16 @@ mm_result mm_context_uninit(mm_context* ctx);
 ```c
 printf("Running as: %s\n", ctx.name);
 ```
+
+`mm_context_caps` returns a bitmask:
+
+| Flag | Meaning |
+|------|---------|
+| `MM_CAP_MIDI1` | Existing `mm_message` MIDI 1.0 API |
+| `MM_CAP_UMP` | Raw Universal MIDI Packet I/O |
+| `MM_CAP_MIDI2` | Backend can opt into MIDI 2.0 UMP mode |
+| `MM_CAP_VIRTUAL_IN` | Virtual MIDI input supported |
+| `MM_CAP_VIRTUAL_OUT` | Virtual MIDI output supported |
 
 ### Enumeration
 
@@ -251,6 +266,8 @@ mm_result mm_out_name (mm_context* ctx, uint32_t idx, char* buf, size_t bufsz);
 ```c
 mm_result mm_in_open  (mm_context* ctx, mm_device* dev, uint32_t idx,
                        mm_callback cb, void* userdata);
+mm_result mm_in_open_ump(mm_context* ctx, mm_device* dev, uint32_t idx,
+                         mm_ump_callback cb, void* userdata);
 mm_result mm_in_start (mm_device* dev);
 mm_result mm_in_stop  (mm_device* dev);
 mm_result mm_in_close (mm_device* dev);
@@ -268,9 +285,31 @@ returns `MM_SUCCESS`.
 ```c
 mm_result mm_out_open      (mm_context* ctx, mm_device* dev, uint32_t idx);
 mm_result mm_out_send      (mm_device* dev, const mm_message* msg);
+mm_result mm_out_send_ump  (mm_device* dev, const mm_ump_packet* pkt);
 mm_result mm_out_send_sysex(mm_device* dev, const uint8_t* data, size_t size);
 mm_result mm_out_close     (mm_device* dev);
 ```
+
+### MIDI 2.0 / UMP
+
+The existing `mm_message` API remains MIDI 1.0-oriented. Raw MIDI 2.0
+compatibility is additive through Universal MIDI Packets:
+
+```c
+typedef struct mm_ump_packet {
+    uint32_t words[4];
+    uint8_t  word_count;    /* 1..4 */
+    double   timestamp;
+} mm_ump_packet;
+
+typedef void (*mm_ump_callback)(mm_device* dev,
+                                const mm_ump_packet* pkt,
+                                void* userdata);
+```
+
+On Linux with ALSA UMP support, `mm_in_open_ump` receives raw UMP packets and
+`mm_out_send_ump` sends raw packets through an opened output. Unsupported
+backends return `MM_NO_BACKEND`.
 
 ---
 
@@ -429,6 +468,7 @@ const char* mm_result_string(mm_result r);
 | `examples/through.c` | `"midi-through"` | Forward input[N] → output[N] in real time |
 | `examples/daw_sync.c` | `"daw-sync"` | Clock, transport, SPP, MTC from a DAW |
 | `examples/virtual.c` | `"my-synth"` | Virtual input — VMPK / DAW sends directly to us |
+| `examples/ump_monitor.c` | `"ump-monitor"` | Raw UMP input monitor for ALSA MIDI 2.0 |
 | `examples/web_monitor.c` | `"web-midi-monitor"` | Web MIDI input monitor for Emscripten |
 | `examples/web_sender.c` | `"web-midi-test-source"` | Native virtual source for testing Web MIDI input |
 
@@ -439,6 +479,7 @@ Most terminal examples accept a port index as a command-line argument:
 ./output_test 1      # open output[1]
 ./through 0 2        # input[0] → output[2]
 ./daw_sync 1         # open input[1]
+./ump_monitor 1      # open input[1] for raw UMP
 ./web_sender 0       # emit Web MIDI test events until Ctrl-C
 ```
 
@@ -564,7 +605,39 @@ virtual MIDI cable and send to it with `examples/output.c`.
 
 ---
 
+## MIDI 2.0 / UMP
+
+MIDI 2.0 compatibility is opt-in and additive. Existing `mm_in_open`,
+`mm_out_send`, and `mm_message` code continues to use the MIDI 1.0-style API.
+Applications that need raw Universal MIDI Packets can check capabilities and
+open a UMP input:
+
+```c
+if (mm_context_caps(&ctx) & MM_CAP_UMP) {
+    mm_in_open_ump(&ctx, &dev, 0, on_ump, NULL);
+    mm_in_start(&dev);
+}
+```
+
+Linux/ALSA is the first implemented UMP backend. It requires ALSA sequencer
+UMP support in the installed headers/runtime. macOS CoreMIDI has MIDI 2.0
+support at the platform level, but minimidio's CoreMIDI backend does not yet
+expose raw UMP. Windows requires a future Windows MIDI Services backend; WinMM
+cannot carry real MIDI 2.0 UMP. Web MIDI is currently byte-message oriented,
+so raw UMP calls return `MM_NO_BACKEND` there.
+
+---
+
 ## Changelog
+
+### v0.5.0-dev — MIDI 2.0 / UMP compatibility branch
+- **API: added raw UMP support** via `mm_ump_packet`, `mm_ump_callback`,
+  `mm_in_open_ump`, and `mm_out_send_ump`.
+- **API: added `mm_context_caps`** for backend feature discovery.
+- **ALSA: added MIDI 2.0/UMP path** using ALSA sequencer UMP APIs when
+  available. Unsupported ALSA builds return `MM_NO_BACKEND` for UMP calls.
+- **Examples: added `examples/ump_monitor.c`** for raw UMP input monitoring.
+- **Compatibility: existing MIDI 1.0 APIs remain unchanged**.
 
 ### v0.4.1 — bug fixes, no API changes
 - **Web / Emscripten: added Web MIDI backend**. Normal input/output works
