@@ -10,9 +10,10 @@
 #include "minimidio.h"
 ```
 
-One file to copy into your project. OS MIDI libraries are the only dependencies —
-all present by default on macOS and Windows. On Linux you need `libasound2-dev`
-for headers at build time and `libasound2` at runtime (standard on any ALSA system).
+One file to copy into your project. Native builds use the OS MIDI libraries.
+On Linux you need `libasound2-dev` for headers at build time and `libasound2`
+at runtime (standard on any ALSA system). Web builds use the browser Web MIDI
+API through Emscripten.
 
 ---
 
@@ -24,6 +25,7 @@ for headers at build time and `libasound2` at runtime (standard on any ALSA syst
 | Windows (MSVC) | WinMM | automatic via `#pragma comment(lib, "winmm.lib")` |
 | Windows (MinGW / Clang) | WinMM | `-lwinmm` |
 | Linux | ALSA sequencer | `-lasound -lpthread` |
+| Web / Emscripten | Web MIDI | `-sASYNCIFY` |
 
 ---
 
@@ -44,6 +46,9 @@ zig cc my_app.c -target x86_64-windows-gnu -lwinmm -o my_app.exe
 #   Ubuntu/Debian: sudo apt install libasound2-dev
 #   Fedora/RHEL:   sudo dnf install alsa-lib-devel
 cc my_app.c -lasound -lpthread -o my_app
+
+# Web / Emscripten — requires browser Web MIDI support and permission
+emcc my_app.c -sASYNCIFY -o my_app.html
 ```
 
 ---
@@ -152,6 +157,10 @@ WinMM has no virtual port API. Workaround: install
 [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html), create a
 virtual cable there, then use the regular `mm_in_open` / `mm_out_open` with
 that port index.
+
+**Web / Emscripten**: `mm_in_open_virtual` / `mm_out_open_virtual` return
+`MM_NO_BACKEND`. The browser Web MIDI API can access user-approved MIDI
+devices, but it cannot create OS-level virtual MIDI ports.
 
 ### start / stop / close
 
@@ -405,6 +414,7 @@ const char* mm_result_string(mm_result r);
 |-------|---------|---------|
 | `MM_MAX_PORTS` | 64 | Maximum enumerable ports |
 | `MM_SYSEX_BUF_SIZE` | 4096 | Per-device sysex buffer (bytes) |
+| `MM_WEBMIDI_ENABLE_SYSEX` | 0 | Request browser SysEx permission on Web MIDI |
 | `MM_ASSERT(x)` | `assert(x)` | Override assertion |
 
 ---
@@ -418,14 +428,21 @@ const char* mm_result_string(mm_result r);
 | `examples/through.c` | `"midi-through"` | Forward input[N] → output[N] in real time |
 | `examples/daw_sync.c` | `"daw-sync"` | Clock, transport, SPP, MTC from a DAW |
 | `examples/virtual.c` | `"my-synth"` | Virtual input — VMPK / DAW sends directly to us |
+| `examples/web_monitor.c` | `"web-midi-monitor"` | Web MIDI input monitor for Emscripten |
 
-All examples accept a port index as a command-line argument:
+The terminal examples accept a port index as a command-line argument:
 
 ```bash
 ./monitor 2          # open input[2]
 ./output_test 1      # open output[1]
 ./through 0 2        # input[0] → output[2]
 ./daw_sync 1         # open input[1]
+```
+
+The Web MIDI example opens input[0] after browser permission is granted:
+
+```bash
+emcc examples/web_monitor.c -sASYNCIFY -o web_monitor.html
 ```
 
 ---
@@ -451,15 +468,44 @@ the client name you registered with `mm_context_init`.
 
 `mm_context_*`, `mm_in_*`, `mm_out_*` should be called from one thread only.
 The callback runs on a backend-managed background thread (CoreMIDI's run-loop
-thread, WinMM's callback thread, or a `pthread` on Linux). Protect any shared
-state with a mutex. `mm_out_send` / `mm_out_send_sysex` are safe to call from
-the callback thread.
+thread, WinMM's callback thread, a `pthread` on Linux, or the browser event
+loop on Web MIDI). Protect any shared state with a mutex when using native
+threads. `mm_out_send` / `mm_out_send_sysex` are safe to call from the callback
+thread.
+
+---
+
+## Web MIDI / Emscripten
+
+When compiling with Emscripten, minimidio uses the browser Web MIDI API.
+Build with Asyncify because `mm_context_init` requests MIDI access through the
+browser's asynchronous permission flow:
+
+```bash
+emcc examples/web_monitor.c -sASYNCIFY -o web_monitor.html
+```
+
+Serve the page from `localhost` or HTTPS. Browser support is not universal, and
+users may deny MIDI permission. SysEx is disabled by default; opt in before
+including the header if your app needs it:
+
+```c
+#define MM_WEBMIDI_ENABLE_SYSEX 1
+#define MINIMIDIO_IMPLEMENTATION
+#include "minimidio.h"
+```
+
+Virtual MIDI ports are not available in browsers, so the virtual-port APIs
+return `MM_NO_BACKEND` on Web MIDI.
 
 ---
 
 ## Changelog
 
 ### v0.4.1 — bug fixes, no API changes
+- **Web / Emscripten: added Web MIDI backend**. Normal input/output works
+  through the browser Web MIDI API when built with `-sASYNCIFY`. SysEx is
+  opt-in via `MM_WEBMIDI_ENABLE_SYSEX`; virtual ports return `MM_NO_BACKEND`.
 - **All backends: tightened argument validation** for port-name buffers and
   unsupported output message types.
 - **ALSA: fixed input start/stop lifecycle**. Stop-before-start is harmless,

@@ -2,7 +2,17 @@
 minimidio.h - v0.4.1 - Single-file cross-platform MIDI input/output library
 
 CHANGES v0.4.1
-  Bug fixes — no API changes.
+  Web MIDI support and bug fixes — no API changes.
+
+  Web / Emscripten:
+    - Added Web MIDI backend for browser builds. Compile with Emscripten and
+      -sASYNCIFY because mm_context_init() requests MIDI access through the
+      browser's asynchronous permission flow.
+    - Normal input/output maps to navigator.requestMIDIAccess(), MIDIInput
+      midimessage events, and MIDIOutput.send().
+    - SysEx is opt-in: #define MM_WEBMIDI_ENABLE_SYSEX 1 before including.
+    - Virtual ports return MM_NO_BACKEND; browsers cannot create OS-level
+      virtual MIDI ports.
 
   ALSA:
     - Dropped dlopen/dlsym approach. All ALSA sequencer functions are inline
@@ -111,6 +121,7 @@ ABOUT
     macOS / iOS  : CoreMIDI   (CoreMIDI.framework  — always present)
     Windows      : WinMM      (winmm.dll            — always present)
     Linux        : ALSA seq   (libasound            — link with -lasound)
+    Web          : Web MIDI   (Emscripten           — build with -sASYNCIFY)
 
 LICENSE
   MIT — see end of file.
@@ -180,8 +191,9 @@ SONG POSITION MATHS
 CONFIGURATION DEFINES (before #include)
 
     #define MM_MAX_PORTS          64   // max enumerable ports
-    #define MM_SYSEX_BUF_SIZE  4096   // per-device sysex buffer (bytes)
-    #define MM_ASSERT(x)              // override assertion macro
+    #define MM_SYSEX_BUF_SIZE      4096   // per-device sysex buffer (bytes)
+    #define MM_WEBMIDI_ENABLE_SYSEX   1   // request browser SysEx permission
+    #define MM_ASSERT(x)                  // override assertion macro
 */
 
 #ifndef MINIMIDIO_H
@@ -202,6 +214,9 @@ extern "C" {
 #endif
 #ifndef MM_SYSEX_BUF_SIZE
 #  define MM_SYSEX_BUF_SIZE 4096
+#endif
+#ifndef MM_WEBMIDI_ENABLE_SYSEX
+#  define MM_WEBMIDI_ENABLE_SYSEX 0
 #endif
 #ifndef MM_ASSERT
 #  include <assert.h>
@@ -364,7 +379,9 @@ static inline mm_message mm_make_message(uint8_t status, uint8_t d1, uint8_t d2)
    Platform detection
    ══════════════════════════════════════════════════════════════════════════ */
 
-#if defined(__APPLE__)
+#if defined(__EMSCRIPTEN__)
+#  define MM_BACKEND_WEBMIDI
+#elif defined(__APPLE__)
 #  define MM_BACKEND_COREMIDI
 #elif defined(_WIN32)
 #  define MM_BACKEND_WINMM
@@ -432,6 +449,19 @@ typedef struct mm__dev_alsa {
     size_t         sysex_pos;
 } mm__dev_alsa;
 
+#elif defined(MM_BACKEND_WEBMIDI)
+#  include <emscripten.h>
+
+typedef struct { int sysex_enabled; } mm__ctx_webmidi;
+
+typedef struct {
+    int input_idx;
+    int output_idx;
+    int started;
+    uint8_t sysex_buf[MM_SYSEX_BUF_SIZE];
+    size_t  sysex_pos;
+} mm__dev_webmidi;
+
 #endif /* backends */
 
 /* ══════════════════════════════════════════════════════════════════════════════
@@ -445,6 +475,8 @@ struct mm_context {
     mm__ctx_winmm    wm;
 #elif defined(MM_BACKEND_ALSA)
     mm__ctx_alsa     al;
+#elif defined(MM_BACKEND_WEBMIDI)
+    mm__ctx_webmidi  web;
 #endif
     int  initialized;
     char name[64];   /* app name shown to other MIDI clients (CoreMIDI, ALSA) */
@@ -463,6 +495,8 @@ struct mm_device {
     mm__dev_winmm    wm;
 #elif defined(MM_BACKEND_ALSA)
     mm__dev_alsa     al;
+#elif defined(MM_BACKEND_WEBMIDI)
+    mm__dev_webmidi  web;
 #endif
 };
 
@@ -1493,7 +1527,338 @@ mm_result mm_out_open_virtual(mm_context* ctx, mm_device* dev)
     dev->is_open=1; return MM_SUCCESS;
 }
 
-#endif /* ALSA backend */
+#elif defined(MM_BACKEND_WEBMIDI)
+
+EM_ASYNC_JS(int, mm__web_init_js, (int sysex), {
+    if (typeof navigator === 'undefined' || !navigator.requestMIDIAccess)
+        return -3; /* MM_NO_BACKEND */
+    try {
+        var access = await navigator.requestMIDIAccess({ sysex: !!sysex });
+        Module['__minimidio_webmidi'] = {
+            access: access,
+            inputs: Array.from(access.inputs.values()),
+            outputs: Array.from(access.outputs.values()),
+            sysex: !!access.sysexEnabled
+        };
+        access.onstatechange = function() {
+            var s = Module['__minimidio_webmidi'];
+            if (!s || !s.access) return;
+            s.inputs = Array.from(s.access.inputs.values());
+            s.outputs = Array.from(s.access.outputs.values());
+        };
+        return 0; /* MM_SUCCESS */
+    } catch (e) {
+        return -1; /* MM_ERROR */
+    }
+});
+
+EM_JS(int, mm__web_sysex_enabled_js, (void), {
+    var s = Module['__minimidio_webmidi'];
+    return (s && s.sysex) ? 1 : 0;
+});
+
+EM_JS(int, mm__web_in_count_js, (void), {
+    var s = Module['__minimidio_webmidi'];
+    if (s && s.access) {
+        s.inputs = Array.from(s.access.inputs.values());
+        s.outputs = Array.from(s.access.outputs.values());
+    }
+    return s ? s.inputs.length : 0;
+});
+
+EM_JS(int, mm__web_out_count_js, (void), {
+    var s = Module['__minimidio_webmidi'];
+    if (s && s.access) {
+        s.inputs = Array.from(s.access.inputs.values());
+        s.outputs = Array.from(s.access.outputs.values());
+    }
+    return s ? s.outputs.length : 0;
+});
+
+EM_JS(int, mm__web_in_name_js, (int idx, char* buf, int sz), {
+    var s = Module['__minimidio_webmidi'];
+    if (s && s.access) {
+        s.inputs = Array.from(s.access.inputs.values());
+        s.outputs = Array.from(s.access.outputs.values());
+    }
+    if (!s || idx < 0 || idx >= s.inputs.length) return -4; /* MM_OUT_OF_RANGE */
+    var p = s.inputs[idx];
+    var name = p.name || p.manufacturer || p.id || '(unknown)';
+    stringToUTF8(name, buf, sz);
+    return 0;
+});
+
+EM_JS(int, mm__web_out_name_js, (int idx, char* buf, int sz), {
+    var s = Module['__minimidio_webmidi'];
+    if (s && s.access) {
+        s.inputs = Array.from(s.access.inputs.values());
+        s.outputs = Array.from(s.access.outputs.values());
+    }
+    if (!s || idx < 0 || idx >= s.outputs.length) return -4; /* MM_OUT_OF_RANGE */
+    var p = s.outputs[idx];
+    var name = p.name || p.manufacturer || p.id || '(unknown)';
+    stringToUTF8(name, buf, sz);
+    return 0;
+});
+
+EM_JS(int, mm__web_in_start_js, (int idx, int devp, int dispatch), {
+    var s = Module['__minimidio_webmidi'];
+    if (s && s.access) {
+        s.inputs = Array.from(s.access.inputs.values());
+        s.outputs = Array.from(s.access.outputs.values());
+    }
+    if (!s || idx < 0 || idx >= s.inputs.length) return -4; /* MM_OUT_OF_RANGE */
+    var input = s.inputs[idx];
+    var cb = getWasmTableEntry(dispatch);
+    input.onmidimessage = function(e) {
+        var n = e.data.length;
+        var p = _malloc(n);
+        if (!p) return;
+        HEAPU8.set(e.data, p);
+        cb(devp, e.timeStamp / 1000.0, p, n);
+        _free(p);
+    };
+    return 0;
+});
+
+EM_JS(void, mm__web_in_stop_js, (int idx), {
+    var s = Module['__minimidio_webmidi'];
+    if (s && s.access) {
+        s.inputs = Array.from(s.access.inputs.values());
+        s.outputs = Array.from(s.access.outputs.values());
+    }
+    if (!s || idx < 0 || idx >= s.inputs.length) return;
+    s.inputs[idx].onmidimessage = null;
+});
+
+EM_JS(int, mm__web_out_send_raw_js, (int idx, const uint8_t* data, int size), {
+    var s = Module['__minimidio_webmidi'];
+    if (s && s.access) {
+        s.inputs = Array.from(s.access.inputs.values());
+        s.outputs = Array.from(s.access.outputs.values());
+    }
+    if (!s || idx < 0 || idx >= s.outputs.length) return -4; /* MM_OUT_OF_RANGE */
+    try {
+        s.outputs[idx].send(Array.from(HEAPU8.subarray(data, data + size)));
+        return 0;
+    } catch (e) {
+        return -1; /* MM_ERROR */
+    }
+});
+
+static void mm__web_dispatch_raw(uintptr_t devp, double ts, const uint8_t* data, int size)
+{
+    mm_device* dev = (mm_device*)devp;
+    if (!dev || !dev->callback || !data || size <= 0) return;
+
+    int j = 0;
+    while (j < size) {
+        uint8_t s = data[j];
+        mm_message msg; memset(&msg, 0, sizeof(msg)); msg.timestamp = ts;
+
+        if (s >= 0xF8) {
+            switch (s) {
+                case 0xF8: msg.type = MM_CLOCK;        break;
+                case 0xFA: msg.type = MM_START;        break;
+                case 0xFB: msg.type = MM_CONTINUE;     break;
+                case 0xFC: msg.type = MM_STOP;         break;
+                case 0xFE: msg.type = MM_ACTIVE_SENSE; break;
+                case 0xFF: msg.type = MM_RESET;        break;
+                default:   j++; continue;
+            }
+            dev->callback(dev, &msg, dev->userdata); j++; continue;
+        }
+
+        if (s == 0xF0) {
+            size_t n = (size_t)(size - j);
+            if (n <= MM_SYSEX_BUF_SIZE - dev->web.sysex_pos) {
+                memcpy(dev->web.sysex_buf + dev->web.sysex_pos, data + j, n);
+                dev->web.sysex_pos += n;
+            } else {
+                dev->web.sysex_pos = 0;
+            }
+            if (n > 0 && data[size - 1] == 0xF7 && dev->web.sysex_pos > 0) {
+                msg.type = MM_SYSEX;
+                msg.sysex = dev->web.sysex_buf;
+                msg.sysex_size = dev->web.sysex_pos;
+                dev->callback(dev, &msg, dev->userdata);
+                dev->web.sysex_pos = 0;
+            }
+            break;
+        }
+
+        if (s >= 0xF1 && s <= 0xF6) {
+            j++;
+            switch (s) {
+                case 0xF1:
+                    msg.type = MM_MTC_QUARTER_FRAME;
+                    if (j < size) msg.data[0] = data[j++];
+                    dev->callback(dev, &msg, dev->userdata); break;
+                case 0xF2:
+                    msg.type = MM_SONG_POSITION;
+                    if (j + 1 < size) {
+                        uint8_t lsb = data[j++];
+                        uint8_t msb = data[j++];
+                        msg.song_position = (uint16_t)(lsb | ((uint16_t)msb << 7));
+                        msg.data[0] = lsb; msg.data[1] = msb;
+                    }
+                    dev->callback(dev, &msg, dev->userdata); break;
+                case 0xF3:
+                    msg.type = MM_SONG_SELECT;
+                    if (j < size) msg.data[0] = data[j++];
+                    dev->callback(dev, &msg, dev->userdata); break;
+                case 0xF6:
+                    msg.type = MM_TUNE_REQUEST;
+                    dev->callback(dev, &msg, dev->userdata); break;
+                default: break;
+            }
+            continue;
+        }
+
+        if (s >= 0x80) {
+            msg.type = (mm_message_type)((s >> 4) & 0x0F);
+            msg.channel = s & 0x0F; j++;
+            if (j < size) msg.data[0] = data[j++];
+            switch (msg.type) {
+                case MM_NOTE_OFF: case MM_NOTE_ON: case MM_POLY_PRESSURE:
+                case MM_CONTROL_CHANGE: case MM_PITCH_BEND:
+                    if (j < size) msg.data[1] = data[j++];
+                    break;
+                default: break;
+            }
+            dev->callback(dev, &msg, dev->userdata); continue;
+        }
+        j++;
+    }
+}
+
+mm_result mm_context_init(mm_context* ctx, const char* name) {
+    if (!ctx) return MM_INVALID_ARG;
+    memset(ctx, 0, sizeof(*ctx));
+    strncpy(ctx->name, (name && name[0]) ? name : "minimidio", sizeof(ctx->name)-1);
+    mm_result r = (mm_result)mm__web_init_js(MM_WEBMIDI_ENABLE_SYSEX ? 1 : 0);
+    if (r != MM_SUCCESS) return r;
+    ctx->web.sysex_enabled = mm__web_sysex_enabled_js();
+    ctx->initialized = 1; return MM_SUCCESS;
+}
+
+mm_result mm_context_uninit(mm_context* ctx) {
+    if (!ctx||!ctx->initialized) return MM_INVALID_ARG;
+    ctx->initialized = 0; return MM_SUCCESS;
+}
+
+uint32_t mm_in_count(mm_context* ctx) {
+    if (!ctx||!ctx->initialized) return 0;
+    return (uint32_t)mm__web_in_count_js();
+}
+uint32_t mm_out_count(mm_context* ctx) {
+    if (!ctx||!ctx->initialized) return 0;
+    return (uint32_t)mm__web_out_count_js();
+}
+mm_result mm_in_name(mm_context* ctx, uint32_t idx, char* buf, size_t sz) {
+    if (!ctx||!ctx->initialized||!buf||sz==0) return MM_INVALID_ARG;
+    return (mm_result)mm__web_in_name_js((int)idx, buf, (int)sz);
+}
+mm_result mm_out_name(mm_context* ctx, uint32_t idx, char* buf, size_t sz) {
+    if (!ctx||!ctx->initialized||!buf||sz==0) return MM_INVALID_ARG;
+    return (mm_result)mm__web_out_name_js((int)idx, buf, (int)sz);
+}
+
+mm_result mm_in_open(mm_context* ctx, mm_device* dev, uint32_t idx,
+                     mm_callback cb, void* ud)
+{
+    if (!ctx||!ctx->initialized||!dev||!cb) return MM_INVALID_ARG;
+    if (idx >= mm_in_count(ctx)) return MM_OUT_OF_RANGE;
+    memset(dev,0,sizeof(*dev));
+    dev->ctx=ctx; dev->callback=cb; dev->userdata=ud; dev->is_input=1;
+    dev->web.input_idx=(int)idx; dev->is_open=1; return MM_SUCCESS;
+}
+
+mm_result mm_in_start(mm_device* dev) {
+    if (!dev||!dev->is_open||!dev->is_input) return MM_NOT_OPEN;
+    if (dev->web.started) return MM_ALREADY_OPEN;
+    mm_result r = (mm_result)mm__web_in_start_js(dev->web.input_idx,
+        (int)(uintptr_t)dev, (int)(uintptr_t)mm__web_dispatch_raw);
+    if (r != MM_SUCCESS) return r;
+    dev->web.started=1; return MM_SUCCESS;
+}
+
+mm_result mm_in_stop(mm_device* dev) {
+    if (!dev||!dev->is_open||!dev->is_input) return MM_NOT_OPEN;
+    if (!dev->web.started) return MM_SUCCESS;
+    mm__web_in_stop_js(dev->web.input_idx);
+    dev->web.started=0; return MM_SUCCESS;
+}
+
+mm_result mm_in_close(mm_device* dev) {
+    if (!dev||!dev->is_open) return MM_NOT_OPEN;
+    if (dev->web.started) mm_in_stop(dev);
+    dev->is_open=0; return MM_SUCCESS;
+}
+
+mm_result mm_out_open(mm_context* ctx, mm_device* dev, uint32_t idx) {
+    if (!ctx||!ctx->initialized||!dev) return MM_INVALID_ARG;
+    if (idx >= mm_out_count(ctx)) return MM_OUT_OF_RANGE;
+    memset(dev,0,sizeof(*dev));
+    dev->ctx=ctx; dev->is_input=0; dev->web.output_idx=(int)idx;
+    dev->is_open=1; return MM_SUCCESS;
+}
+
+mm_result mm_out_send(mm_device* dev, const mm_message* msg) {
+    if (!dev||!dev->is_open||dev->is_input) return MM_NOT_OPEN;
+    if (!msg) return MM_INVALID_ARG;
+    uint8_t raw[3]; int len=1;
+    switch (msg->type) {
+        case MM_NOTE_OFF: case MM_NOTE_ON: case MM_POLY_PRESSURE:
+        case MM_CONTROL_CHANGE: case MM_PITCH_BEND:
+            raw[0]=(uint8_t)(((uint8_t)msg->type<<4)|(msg->channel&0xF));
+            raw[1]=msg->data[0]; raw[2]=msg->data[1]; len=3; break;
+        case MM_PROGRAM_CHANGE: case MM_CHANNEL_PRESSURE:
+            raw[0]=(uint8_t)(((uint8_t)msg->type<<4)|(msg->channel&0xF));
+            raw[1]=msg->data[0]; len=2; break;
+        case MM_SONG_POSITION:
+            raw[0]=0xF2; raw[1]=(uint8_t)(msg->song_position&0x7F);
+            raw[2]=(uint8_t)((msg->song_position>>7)&0x7F); len=3; break;
+        case MM_MTC_QUARTER_FRAME: raw[0]=0xF1; raw[1]=msg->data[0]; len=2; break;
+        case MM_SONG_SELECT:       raw[0]=0xF3; raw[1]=msg->data[0]; len=2; break;
+        case MM_TUNE_REQUEST:      raw[0]=0xF6; len=1; break;
+        case MM_CLOCK:             raw[0]=0xF8; len=1; break;
+        case MM_START:             raw[0]=0xFA; len=1; break;
+        case MM_CONTINUE:          raw[0]=0xFB; len=1; break;
+        case MM_STOP:              raw[0]=0xFC; len=1; break;
+        case MM_ACTIVE_SENSE:      raw[0]=0xFE; len=1; break;
+        case MM_RESET:             raw[0]=0xFF; len=1; break;
+        default: return MM_INVALID_ARG;
+    }
+    return (mm_result)mm__web_out_send_raw_js(dev->web.output_idx, raw, len);
+}
+
+mm_result mm_out_send_sysex(mm_device* dev, const uint8_t* data, size_t size) {
+    if (!dev||!dev->is_open||dev->is_input) return MM_NOT_OPEN;
+    if (!data||!size||size>MM_SYSEX_BUF_SIZE) return MM_INVALID_ARG;
+    if (!dev->ctx->web.sysex_enabled) return MM_NO_BACKEND;
+    return (mm_result)mm__web_out_send_raw_js(dev->web.output_idx, data, (int)size);
+}
+
+mm_result mm_out_close(mm_device* dev) {
+    if (!dev||!dev->is_open) return MM_NOT_OPEN;
+    dev->is_open=0; return MM_SUCCESS;
+}
+
+mm_result mm_in_open_virtual(mm_context* ctx, mm_device* dev,
+                              mm_callback cb, void* ud)
+{
+    (void)ctx; (void)dev; (void)cb; (void)ud;
+    return MM_NO_BACKEND;
+}
+
+mm_result mm_out_open_virtual(mm_context* ctx, mm_device* dev)
+{
+    (void)ctx; (void)dev;
+    return MM_NO_BACKEND;
+}
+
+#endif /* backend implementation */
 
 #endif /* MINIMIDIO_IMPLEMENTATION */
 
