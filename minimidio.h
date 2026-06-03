@@ -426,6 +426,7 @@ typedef struct mm__dev_alsa {
     int            target_port;
     pthread_t      thread;
     volatile int   running;
+    int            thread_started;
     int            wake_pipe[2];   /* [0]=read [1]=write, used to unblock poll() */
     uint8_t        sysex_buf[MM_SYSEX_BUF_SIZE];
     size_t         sysex_pos;
@@ -645,6 +646,7 @@ uint32_t mm_in_count (mm_context* ctx) { (void)ctx; return (uint32_t)MIDIGetNumb
 uint32_t mm_out_count(mm_context* ctx) { (void)ctx; return (uint32_t)MIDIGetNumberOfDestinations();  }
 
 static mm_result mm__cm_name(MIDIEndpointRef ep, char* buf, size_t sz) {
+    if (!buf || sz == 0) return MM_INVALID_ARG;
     CFStringRef n = NULL;
     MIDIObjectGetStringProperty(ep, kMIDIPropertyDisplayName, &n);
     if (!n) MIDIObjectGetStringProperty(ep, kMIDIPropertyName, &n);
@@ -654,11 +656,13 @@ static mm_result mm__cm_name(MIDIEndpointRef ep, char* buf, size_t sz) {
 }
 mm_result mm_in_name(mm_context* ctx, uint32_t idx, char* buf, size_t sz) {
     (void)ctx;
+    if (!buf || sz == 0) return MM_INVALID_ARG;
     if (idx >= MIDIGetNumberOfSources()) return MM_OUT_OF_RANGE;
     return mm__cm_name(MIDIGetSource(idx), buf, sz);
 }
 mm_result mm_out_name(mm_context* ctx, uint32_t idx, char* buf, size_t sz) {
     (void)ctx;
+    if (!buf || sz == 0) return MM_INVALID_ARG;
     if (idx >= MIDIGetNumberOfDestinations()) return MM_OUT_OF_RANGE;
     return mm__cm_name(MIDIGetDestination(idx), buf, sz);
 }
@@ -838,11 +842,13 @@ uint32_t mm_out_count(mm_context* ctx) { (void)ctx; return (uint32_t)midiOutGetN
 
 mm_result mm_in_name(mm_context* ctx, uint32_t idx, char* buf, size_t sz) {
     (void)ctx; MIDIINCAPSA c;
+    if (!buf || sz == 0) return MM_INVALID_ARG;
     if (midiInGetDevCapsA(idx,&c,sizeof(c))!=MMSYSERR_NOERROR) return MM_OUT_OF_RANGE;
     strncpy(buf,c.szPname,sz-1); buf[sz-1]='\0'; return MM_SUCCESS;
 }
 mm_result mm_out_name(mm_context* ctx, uint32_t idx, char* buf, size_t sz) {
     (void)ctx; MIDIOUTCAPSA c;
+    if (!buf || sz == 0) return MM_INVALID_ARG;
     if (midiOutGetDevCapsA(idx,&c,sizeof(c))!=MMSYSERR_NOERROR) return MM_OUT_OF_RANGE;
     strncpy(buf,c.szPname,sz-1); buf[sz-1]='\0'; return MM_SUCCESS;
 }
@@ -950,6 +956,15 @@ mm_result mm_out_send(mm_device* dev, const mm_message* msg) {
     if (!msg) return MM_INVALID_ARG;
     DWORD pk;
     switch (msg->type) {
+        case MM_NOTE_OFF: case MM_NOTE_ON: case MM_POLY_PRESSURE:
+        case MM_CONTROL_CHANGE: case MM_PITCH_BEND: {
+            uint8_t st=(uint8_t)(((uint8_t)msg->type<<4)|(msg->channel&0xF));
+            pk=st|((DWORD)msg->data[0]<<8)|((DWORD)msg->data[1]<<16); break;
+        }
+        case MM_PROGRAM_CHANGE: case MM_CHANNEL_PRESSURE: {
+            uint8_t st=(uint8_t)(((uint8_t)msg->type<<4)|(msg->channel&0xF));
+            pk=st|((DWORD)msg->data[0]<<8); break;
+        }
         case MM_SONG_POSITION:
             pk=0xF2|((DWORD)(msg->song_position&0x7F)<<8)
                    |((DWORD)((msg->song_position>>7)&0x7F)<<16); break;
@@ -962,10 +977,7 @@ mm_result mm_out_send(mm_device* dev, const mm_message* msg) {
         case MM_STOP:          pk=0xFC; break;
         case MM_ACTIVE_SENSE:  pk=0xFE; break;
         case MM_RESET:         pk=0xFF; break;
-        default: {
-            uint8_t st=(uint8_t)(((uint8_t)msg->type<<4)|(msg->channel&0xF));
-            pk=st|((DWORD)msg->data[0]<<8)|((DWORD)msg->data[1]<<16);
-        }
+        default: return MM_INVALID_ARG;
     }
     return (midiOutShortMsg(dev->wm.out,pk)==MMSYSERR_NOERROR)?MM_SUCCESS:MM_ERROR;
 }
@@ -1087,7 +1099,7 @@ uint32_t mm_out_count(mm_context* ctx) {
     return lst.count;
 }
 mm_result mm_in_name(mm_context* ctx, uint32_t idx, char* buf, size_t sz) {
-    if (!ctx||!ctx->initialized||!buf) return MM_INVALID_ARG;
+    if (!ctx||!ctx->initialized||!buf||sz==0) return MM_INVALID_ARG;
     mm__alsa_pl lst;
     mm__alsa_enum(ctx, &lst,
         SND_SEQ_PORT_CAP_READ|SND_SEQ_PORT_CAP_SUBS_READ,
@@ -1096,7 +1108,7 @@ mm_result mm_in_name(mm_context* ctx, uint32_t idx, char* buf, size_t sz) {
     strncpy(buf, lst.ports[idx].name, sz-1); buf[sz-1]='\0'; return MM_SUCCESS;
 }
 mm_result mm_out_name(mm_context* ctx, uint32_t idx, char* buf, size_t sz) {
-    if (!ctx||!ctx->initialized||!buf) return MM_INVALID_ARG;
+    if (!ctx||!ctx->initialized||!buf||sz==0) return MM_INVALID_ARG;
     mm__alsa_pl lst;
     mm__alsa_enum(ctx, &lst,
         SND_SEQ_PORT_CAP_WRITE|SND_SEQ_PORT_CAP_SUBS_WRITE, 0);
@@ -1237,11 +1249,15 @@ static void* mm__alsa_recv_thread(void* arg)
                 case SND_SEQ_EVENT_SYSEX: {
                     uint8_t* d=(uint8_t*)ev->data.ext.ptr;
                     size_t   n=ev->data.ext.len;
-                    if (da->sysex_pos+n < MM_SYSEX_BUF_SIZE) {
+                    int copied = 0;
+                    if (n <= MM_SYSEX_BUF_SIZE - da->sysex_pos) {
                         memcpy(da->sysex_buf+da->sysex_pos, d, n);
                         da->sysex_pos += n;
+                        copied = 1;
+                    } else {
+                        da->sysex_pos = 0;
                     }
-                    if (n > 0 && d[n-1] == 0xF7) {
+                    if (copied && n > 0 && d[n-1] == 0xF7) {
                         msg.type=MM_SYSEX; msg.sysex=da->sysex_buf;
                         msg.sysex_size=da->sysex_pos;
                         dev->callback(dev,&msg,dev->userdata);
@@ -1287,21 +1303,33 @@ mm_result mm_in_open(mm_context* ctx, mm_device* dev, uint32_t idx,
 
 mm_result mm_in_start(mm_device* dev) {
     if (!dev||!dev->is_open||!dev->is_input) return MM_NOT_OPEN;
+    if (dev->al.thread_started) return MM_ALREADY_OPEN;
     if (!dev->is_virtual) {
         mm__ctx_alsa* al=&dev->ctx->al;
         snd_seq_connect_from(al->seq, dev->al.port_id,
                                   dev->al.target_client, dev->al.target_port);
     }
     dev->al.running=1;
-    pthread_create(&dev->al.thread, NULL, mm__alsa_recv_thread, dev);
+    if (pthread_create(&dev->al.thread, NULL, mm__alsa_recv_thread, dev) != 0) {
+        dev->al.running=0;
+        if (!dev->is_virtual) {
+            mm__ctx_alsa* al=&dev->ctx->al;
+            snd_seq_disconnect_from(al->seq, dev->al.port_id,
+                                         dev->al.target_client, dev->al.target_port);
+        }
+        return MM_ERROR;
+    }
+    dev->al.thread_started=1;
     return MM_SUCCESS;
 }
 
 mm_result mm_in_stop(mm_device* dev) {
     if (!dev||!dev->is_open||!dev->is_input) return MM_NOT_OPEN;
+    if (!dev->al.thread_started) return MM_SUCCESS;
     dev->al.running=0;
     char c=1; (void)write(dev->al.wake_pipe[1], &c, 1); /* wake the poll() */
     pthread_join(dev->al.thread, NULL);
+    dev->al.thread_started=0;
     if (!dev->is_virtual) {
         mm__ctx_alsa* al=&dev->ctx->al;
         snd_seq_disconnect_from(al->seq, dev->al.port_id,
@@ -1359,6 +1387,10 @@ mm_result mm_out_send(mm_device* dev, const mm_message* msg) {
             snd_seq_ev_set_noteoff(&ev,msg->channel,msg->data[0],msg->data[1]); break;
         case MM_CONTROL_CHANGE:
             snd_seq_ev_set_controller(&ev,msg->channel,msg->data[0],msg->data[1]); break;
+        case MM_POLY_PRESSURE:
+            snd_seq_ev_set_keypress(&ev,msg->channel,msg->data[0],msg->data[1]); break;
+        case MM_CHANNEL_PRESSURE:
+            snd_seq_ev_set_chanpress(&ev,msg->channel,msg->data[0]); break;
         case MM_PITCH_BEND: {
             int pb=((int)msg->data[1]<<7)|msg->data[0];
             snd_seq_ev_set_pitchbend(&ev,msg->channel,pb-8192); break;

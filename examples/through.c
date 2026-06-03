@@ -115,7 +115,14 @@ int main(int argc, char* argv[]) {
         mm_out_close(&out); mm_context_uninit(&ctx); return 1;
     }
 
-    mm_in_start(&in);
+    r = mm_in_start(&in);
+    if (r != MM_SUCCESS) {
+        fprintf(stderr, "mm_in_start: %s\n", mm_result_string(r));
+        mm_in_close(&in);
+        mm_out_close(&out);
+        mm_context_uninit(&ctx);
+        return 1;
+    }
 
     char in_name[256], out_name[256];
     mm_in_name(&ctx, in_idx, in_name, sizeof(in_name));

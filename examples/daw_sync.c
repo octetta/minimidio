@@ -176,7 +176,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    printf("=== DAW Sync Monitor — minimidio v0.3.0 ===\n\n");
+    printf("=== DAW Sync Monitor — minimidio v0.4.1 ===\n\n");
     printf("Client name : \"%s\"\n", ctx.name);
     printf("Port names  : \"%s-in\" / \"%s-out\"\n\n", ctx.name, ctx.name);
 

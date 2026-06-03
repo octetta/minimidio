@@ -249,6 +249,10 @@ mm_result mm_in_close (mm_device* dev);
 Callbacks arrive on a **background thread**. Do not call `mm_in_stop` or
 `mm_in_close` from inside a callback.
 
+Calling `mm_in_start` on an already-started input returns `MM_ALREADY_OPEN`.
+Calling `mm_in_stop` on an open input that has not been started is harmless and
+returns `MM_SUCCESS`.
+
 ### Output
 
 ```c
@@ -383,9 +387,9 @@ last_ts = msg->timestamp;
 | `MM_SUCCESS` | OK |
 | `MM_ERROR` | Generic backend error |
 | `MM_INVALID_ARG` | NULL pointer or bad argument |
-| `MM_NO_BACKEND` | libasound not found (Linux only) |
+| `MM_NO_BACKEND` | Feature not supported by this backend |
 | `MM_OUT_OF_RANGE` | Device index too large |
-| `MM_ALREADY_OPEN` | Device already open |
+| `MM_ALREADY_OPEN` | Device already open or input already started |
 | `MM_NOT_OPEN` | Device not open |
 | `MM_ALLOC_FAILED` | Memory allocation failure |
 
@@ -456,6 +460,12 @@ the callback thread.
 ## Changelog
 
 ### v0.4.1 — bug fixes, no API changes
+- **All backends: tightened argument validation** for port-name buffers and
+  unsupported output message types.
+- **ALSA: fixed input start/stop lifecycle**. Stop-before-start is harmless,
+  double-start returns `MM_ALREADY_OPEN`, and thread creation failures clean up.
+- **ALSA: fixed output parity** for poly pressure and channel pressure.
+- **ALSA: fixed exact-size SysEx receive buffering** at `MM_SYSEX_BUF_SIZE`.
 - **ALSA: switched from dlopen to `-lasound`**. All ALSA sequencer functions are
   inline wrappers in `<alsa/asoundlib.h>` and are not exported from `libasound.so`,
   making runtime symbol loading unworkable. Build now requires `-lasound -lpthread`
