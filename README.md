@@ -47,7 +47,8 @@ zig cc my_app.c -target x86_64-windows-gnu -lwinmm -o my_app.exe
 #   Fedora/RHEL:   sudo dnf install alsa-lib-devel
 cc my_app.c -lasound -lpthread -o my_app
 
-# Web / Emscripten — requires browser Web MIDI support and permission
+# Web / Emscripten — requires browser Web MIDI support, permission,
+# and localhost/HTTPS
 emcc my_app.c -sASYNCIFY -o my_app.html
 ```
 
@@ -429,21 +430,78 @@ const char* mm_result_string(mm_result r);
 | `examples/daw_sync.c` | `"daw-sync"` | Clock, transport, SPP, MTC from a DAW |
 | `examples/virtual.c` | `"my-synth"` | Virtual input — VMPK / DAW sends directly to us |
 | `examples/web_monitor.c` | `"web-midi-monitor"` | Web MIDI input monitor for Emscripten |
+| `examples/web_sender.c` | `"web-midi-test-source"` | Native virtual source for testing Web MIDI input |
 
-The terminal examples accept a port index as a command-line argument:
+Most terminal examples accept a port index as a command-line argument:
 
 ```bash
 ./monitor 2          # open input[2]
 ./output_test 1      # open output[1]
 ./through 0 2        # input[0] → output[2]
 ./daw_sync 1         # open input[1]
+./web_sender 0       # emit Web MIDI test events until Ctrl-C
 ```
 
-The Web MIDI example opens input[0] after browser permission is granted:
+The Web MIDI example opens `web-midi-test-source` when present, otherwise
+input[0], after browser permission is granted:
 
 ```bash
 emcc examples/web_monitor.c -sASYNCIFY -o web_monitor.html
 ```
+
+To test Web MIDI without physical MIDI hardware on Linux or macOS, build both
+the browser monitor and the native virtual source:
+
+```bash
+emcc examples/web_monitor.c -sASYNCIFY -o web_monitor.html
+
+# Linux
+cc examples/web_sender.c -lasound -lpthread -o web_sender
+
+# macOS
+cc examples/web_sender.c -framework CoreMIDI -o web_sender
+```
+
+In one terminal, serve the Web build from `localhost`:
+
+```bash
+python3 -m http.server 8000
+```
+
+In another terminal, start the native source:
+
+```bash
+./web_sender
+```
+
+Then open <http://localhost:8000/web_monitor.html> in a browser with Web MIDI
+support.
+
+When the browser asks for MIDI permission, allow it. The Web MIDI input list
+should include `web-midi-test-source`; press Enter in `web_sender` to emit
+Note, CC, pitch bend, song position, clock, start, and stop messages.
+
+On Linux, sandboxed browser packages can hide ALSA sequencer MIDI devices from
+Web MIDI. If `aconnect -l` shows `web-midi-test-source` but the browser lists
+no MIDI inputs, try a non-Flatpak/non-Snap browser or grant the browser device
+access, for example:
+
+```bash
+flatpak override --user --device=all com.google.Chrome
+flatpak kill com.google.Chrome
+```
+
+On Windows, WinMM cannot create virtual MIDI ports, so `web_sender` returns
+`MM_NO_BACKEND`. For hardware-free Web MIDI testing, install loopMIDI, create a
+virtual cable, open `web_monitor.html`, then send to the loopMIDI output with a
+normal output example:
+
+```bat
+cl examples\output.c
+output.exe 0
+```
+
+Use the output index that corresponds to your loopMIDI cable.
 
 ---
 
@@ -498,6 +556,12 @@ including the header if your app needs it:
 Virtual MIDI ports are not available in browsers, so the virtual-port APIs
 return `MM_NO_BACKEND` on Web MIDI.
 
+For hardware-free browser testing on Linux or macOS, use
+`examples/web_sender.c`. It creates a native virtual source named
+`web-midi-test-source`; `examples/web_monitor.c` automatically opens that
+source when the browser exposes it. On Windows, use loopMIDI or another
+virtual MIDI cable and send to it with `examples/output.c`.
+
 ---
 
 ## Changelog
@@ -506,6 +570,11 @@ return `MM_NO_BACKEND` on Web MIDI.
 - **Web / Emscripten: added Web MIDI backend**. Normal input/output works
   through the browser Web MIDI API when built with `-sASYNCIFY`. SysEx is
   opt-in via `MM_WEBMIDI_ENABLE_SYSEX`; virtual ports return `MM_NO_BACKEND`.
+- **Web / Emscripten: fixed compatibility with newer Emscripten glue**.
+  The backend no longer depends on omitted `stringToUTF8` or
+  `getWasmTableEntry` helpers.
+- **Examples: added `examples/web_sender.c`**. Native virtual MIDI source for
+  testing the Web MIDI monitor without physical hardware.
 - **All backends: tightened argument validation** for port-name buffers and
   unsupported output message types.
 - **ALSA: fixed input start/stop lifecycle**. Stop-before-start is harmless,
@@ -563,4 +632,7 @@ return `MM_NO_BACKEND` on Web MIDI.
 
 ## License
 
-MIT — see bottom of `minimidio.h`.
+MIT — see `LICENSE` and the bottom of `minimidio.h`.
+
+See `AUTHORSHIP.md` for the project authorship and AI-assisted development
+process statement.

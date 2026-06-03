@@ -1584,7 +1584,12 @@ EM_JS(int, mm__web_in_name_js, (int idx, char* buf, int sz), {
     if (!s || idx < 0 || idx >= s.inputs.length) return -4; /* MM_OUT_OF_RANGE */
     var p = s.inputs[idx];
     var name = p.name || p.manufacturer || p.id || '(unknown)';
-    stringToUTF8(name, buf, sz);
+    if (sz > 0) {
+        var bytes = new TextEncoder().encode(String(name));
+        var n = Math.min(bytes.length, sz - 1);
+        HEAPU8.set(bytes.subarray(0, n), buf);
+        HEAPU8[buf + n] = 0;
+    }
     return 0;
 });
 
@@ -1597,7 +1602,12 @@ EM_JS(int, mm__web_out_name_js, (int idx, char* buf, int sz), {
     if (!s || idx < 0 || idx >= s.outputs.length) return -4; /* MM_OUT_OF_RANGE */
     var p = s.outputs[idx];
     var name = p.name || p.manufacturer || p.id || '(unknown)';
-    stringToUTF8(name, buf, sz);
+    if (sz > 0) {
+        var bytes = new TextEncoder().encode(String(name));
+        var n = Math.min(bytes.length, sz - 1);
+        HEAPU8.set(bytes.subarray(0, n), buf);
+        HEAPU8[buf + n] = 0;
+    }
     return 0;
 });
 
@@ -1609,13 +1619,19 @@ EM_JS(int, mm__web_in_start_js, (int idx, int devp, int dispatch), {
     }
     if (!s || idx < 0 || idx >= s.inputs.length) return -4; /* MM_OUT_OF_RANGE */
     var input = s.inputs[idx];
-    var cb = getWasmTableEntry(dispatch);
+    var cb = (typeof wasmTable !== 'undefined' && wasmTable.get)
+        ? wasmTable.get(dispatch)
+        : null;
     input.onmidimessage = function(e) {
         var n = e.data.length;
         var p = _malloc(n);
         if (!p) return;
         HEAPU8.set(e.data, p);
-        cb(devp, e.timeStamp / 1000.0, p, n);
+        if (cb) {
+            cb(devp, e.timeStamp / 1000.0, p, n);
+        } else {
+            dynCall('vidii', dispatch, [devp, e.timeStamp / 1000.0, p, n]);
+        }
         _free(p);
     };
     return 0;

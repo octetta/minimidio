@@ -13,6 +13,7 @@
 #include "../minimidio.h"
 
 #include <stdio.h>
+#include <string.h>
 
 #ifdef __EMSCRIPTEN__
 #  include <emscripten.h>
@@ -70,11 +71,18 @@ int main(void) {
     }
 
     uint32_t count = mm_in_count(&ctx);
+    uint32_t port_idx = 0;
+    int found_test_source = 0;
+
     printf("Web MIDI inputs:\n");
     for (uint32_t i = 0; i < count; i++) {
         char name[256];
         mm_in_name(&ctx, i, name, sizeof(name));
-        printf("  [%u] %s%s\n", i, name, i == 0 ? "  <-- will open" : "");
+        if (!found_test_source && strstr(name, "web-midi-test-source")) {
+            port_idx = i;
+            found_test_source = 1;
+        }
+        printf("  [%u] %s\n", i, name);
     }
 
     if (count == 0) {
@@ -83,8 +91,11 @@ int main(void) {
         return 0;
     }
 
+    printf("Opening Web MIDI input[%u]%s.\n",
+           port_idx, found_test_source ? " (web-midi-test-source)" : "");
+
     static mm_device dev;
-    r = mm_in_open(&ctx, &dev, 0, on_midi, NULL);
+    r = mm_in_open(&ctx, &dev, port_idx, on_midi, NULL);
     if (r != MM_SUCCESS) {
         printf("mm_in_open: %s\n", mm_result_string(r));
         mm_context_uninit(&ctx);
@@ -99,7 +110,8 @@ int main(void) {
         return 1;
     }
 
-    printf("Listening for Web MIDI input[0]. Open the browser console for logs.\n");
+    printf("Listening for Web MIDI input[%u]. Open the browser console for logs.\n",
+           port_idx);
 
 #ifdef __EMSCRIPTEN__
     emscripten_exit_with_live_runtime();
