@@ -1,5 +1,28 @@
 /*
-minimidio.h - v0.4.1 - Single-file cross-platform MIDI input/output library
+minimidio.h - v0.5.0-dev - Single-file cross-platform MIDI input/output library
+
+CHANGES v0.5.0-dev
+  MIDI 2.0 / UMP compatibility layer — additive API, existing MIDI 1.0 code
+  remains source-compatible.
+
+  NEW API:
+    mm_context_caps(&ctx)             // backend capability flags
+    mm_in_open_ump(&ctx, &dev, idx, cb, ud)
+    mm_out_send_ump(&dev, &packet)
+
+  NEW TYPES:
+    mm_ump_packet                     // raw Universal MIDI Packet, 1..4 words
+    mm_ump_callback
+
+  Linux/ALSA:
+    - Implements raw UMP receive/send through ALSA sequencer UMP APIs when
+      available in the installed ALSA headers/runtime.
+    - mm_in_open_ump opts the ALSA client into MIDI 2.0 UMP mode and disables
+      ALSA's UMP conversion so raw packets reach the callback.
+
+  macOS/CoreMIDI, Windows/WinMM, Web MIDI:
+    - Existing MIDI 1.0 API remains unchanged.
+    - Raw UMP functions currently return MM_NO_BACKEND on these backends.
 
 CHANGES v0.4.1
   Web MIDI support and bug fixes — no API changes.
@@ -306,6 +329,22 @@ typedef struct mm_message {
     size_t         sysex_size;
 } mm_message;
 
+/* ── MIDI 2.0 / UMP ───────────────────────────────────────────────────────── */
+
+enum {
+    MM_CAP_MIDI1        = 1u << 0,  /* Existing mm_message MIDI 1.0 API */
+    MM_CAP_UMP          = 1u << 1,  /* Raw Universal MIDI Packet I/O */
+    MM_CAP_MIDI2        = 1u << 2,  /* Backend can opt into MIDI 2.0 UMP mode */
+    MM_CAP_VIRTUAL_IN   = 1u << 3,
+    MM_CAP_VIRTUAL_OUT  = 1u << 4,
+};
+
+typedef struct mm_ump_packet {
+    uint32_t words[4];      /* UMP payload, one to four 32-bit words */
+    uint8_t  word_count;    /* 1..4 */
+    double   timestamp;     /* seconds since device opened, when available */
+} mm_ump_packet;
+
 /* ── Forward declarations ───────────────────────────────────────────────────── */
 
 typedef struct mm_context mm_context;
@@ -313,6 +352,8 @@ typedef struct mm_device  mm_device;
 
 /* Called from a background thread. Do NOT call mm_in_stop/close from within. */
 typedef void (*mm_callback)(mm_device* dev, const mm_message* msg, void* userdata);
+typedef void (*mm_ump_callback)(mm_device* dev, const mm_ump_packet* pkt,
+                                void* userdata);
 
 /* ══════════════════════════════════════════════════════════════════════════════
    MTC utilities — header-only, always available
@@ -485,10 +526,12 @@ struct mm_context {
 struct mm_device {
     mm_context* ctx;
     mm_callback callback;
+    mm_ump_callback ump_callback;
     void*       userdata;
     int         is_input;
     int         is_open;
     int         is_virtual;  /* 1 = opened with mm_in/out_open_virtual */
+    int         is_ump;      /* 1 = opened with mm_in_open_ump */
 #if defined(MM_BACKEND_COREMIDI)
     mm__dev_coremidi cm;
 #elif defined(MM_BACKEND_WINMM)
@@ -511,6 +554,7 @@ struct mm_device {
    the hardware port you opened).                                              */
 mm_result   mm_context_init  (mm_context* ctx, const char* name);
 mm_result   mm_context_uninit(mm_context* ctx);
+uint32_t    mm_context_caps  (mm_context* ctx);
 
 uint32_t    mm_in_count (mm_context* ctx);
 mm_result   mm_in_name  (mm_context* ctx, uint32_t idx, char* buf, size_t bufsz);
@@ -519,6 +563,8 @@ mm_result   mm_out_name (mm_context* ctx, uint32_t idx, char* buf, size_t bufsz)
 
 mm_result   mm_in_open  (mm_context* ctx, mm_device* dev, uint32_t idx,
                          mm_callback cb, void* userdata);
+mm_result   mm_in_open_ump(mm_context* ctx, mm_device* dev, uint32_t idx,
+                           mm_ump_callback cb, void* userdata);
 mm_result   mm_in_start (mm_device* dev);
 mm_result   mm_in_stop  (mm_device* dev);
 mm_result   mm_in_close (mm_device* dev);
@@ -533,6 +579,7 @@ mm_result   mm_in_open_virtual(mm_context* ctx, mm_device* dev,
 
 mm_result   mm_out_open      (mm_context* ctx, mm_device* dev, uint32_t idx);
 mm_result   mm_out_send      (mm_device* dev, const mm_message* msg);
+mm_result   mm_out_send_ump  (mm_device* dev, const mm_ump_packet* pkt);
 mm_result   mm_out_send_sysex(mm_device* dev, const uint8_t* data, size_t size);
 mm_result   mm_out_close     (mm_device* dev);
 
@@ -561,6 +608,98 @@ const char* mm_result_string(mm_result r) {
     if (i < 0 || i >= (int)(sizeof(mm__result_strings)/sizeof(*mm__result_strings)))
         return "MM_UNKNOWN";
     return mm__result_strings[i];
+}
+
+static uint8_t mm__ump_word_count_from_type(uint8_t mt) {
+    switch (mt & 0x0F) {
+        case 0x0: return 1; /* Utility */
+        case 0x1: return 1; /* System */
+        case 0x2: return 1; /* MIDI 1.0 Channel Voice */
+        case 0x3: return 2; /* Data Message, 7-bit SysEx */
+        case 0x4: return 2; /* MIDI 2.0 Channel Voice */
+        case 0x5: return 4; /* Data Message, 8-bit */
+        case 0xD: return 4; /* Flex Data */
+        case 0xF: return 4; /* Stream */
+        default:  return 0;
+    }
+}
+
+static int mm__ump_midi1_to_message(const mm_ump_packet* pkt, mm_message* msg) {
+    if (!pkt || !msg || pkt->word_count < 1) return 0;
+    uint32_t w = pkt->words[0];
+    uint8_t mt = (uint8_t)((w >> 28) & 0x0F);
+    if (mt != 0x1 && mt != 0x2) return 0;
+
+    uint8_t status = (uint8_t)((w >> 16) & 0xFF);
+    uint8_t d1     = (uint8_t)((w >>  8) & 0xFF);
+    uint8_t d2     = (uint8_t)( w        & 0xFF);
+
+    memset(msg, 0, sizeof(*msg));
+    msg->timestamp = pkt->timestamp;
+
+    if (mt == 0x1) {
+        switch (status) {
+            case 0xF1: msg->type = MM_MTC_QUARTER_FRAME; msg->data[0] = d1; return 1;
+            case 0xF2:
+                msg->type = MM_SONG_POSITION;
+                msg->data[0] = d1; msg->data[1] = d2;
+                msg->song_position = (uint16_t)(d1 | ((uint16_t)d2 << 7));
+                return 1;
+            case 0xF3: msg->type = MM_SONG_SELECT; msg->data[0] = d1; return 1;
+            case 0xF6: msg->type = MM_TUNE_REQUEST; return 1;
+            case 0xF8: msg->type = MM_CLOCK; return 1;
+            case 0xFA: msg->type = MM_START; return 1;
+            case 0xFB: msg->type = MM_CONTINUE; return 1;
+            case 0xFC: msg->type = MM_STOP; return 1;
+            case 0xFE: msg->type = MM_ACTIVE_SENSE; return 1;
+            case 0xFF: msg->type = MM_RESET; return 1;
+            default: return 0;
+        }
+    }
+
+    if (status < 0x80 || status > 0xEF) return 0;
+    msg->type = (mm_message_type)((status >> 4) & 0x0F);
+    msg->channel = status & 0x0F;
+    msg->data[0] = d1;
+    msg->data[1] = d2;
+    if (msg->type == MM_NOTE_ON && msg->data[1] == 0) msg->type = MM_NOTE_OFF;
+    return 1;
+}
+
+static inline int mm__message_to_ump_midi1(const mm_message* msg, mm_ump_packet* pkt,
+                                           uint8_t group) {
+    if (!msg || !pkt || group > 15) return 0;
+    uint8_t status = 0, d1 = 0, d2 = 0, mt = 0x2;
+
+    switch (msg->type) {
+        case MM_NOTE_OFF: case MM_NOTE_ON: case MM_POLY_PRESSURE:
+        case MM_CONTROL_CHANGE: case MM_PITCH_BEND:
+            status = (uint8_t)(((uint8_t)msg->type << 4) | (msg->channel & 0x0F));
+            d1 = msg->data[0]; d2 = msg->data[1]; break;
+        case MM_PROGRAM_CHANGE: case MM_CHANNEL_PRESSURE:
+            status = (uint8_t)(((uint8_t)msg->type << 4) | (msg->channel & 0x0F));
+            d1 = msg->data[0]; break;
+        case MM_SONG_POSITION:
+            mt = 0x1; status = 0xF2;
+            d1 = (uint8_t)(msg->song_position & 0x7F);
+            d2 = (uint8_t)((msg->song_position >> 7) & 0x7F); break;
+        case MM_MTC_QUARTER_FRAME: mt = 0x1; status = 0xF1; d1 = msg->data[0]; break;
+        case MM_SONG_SELECT:       mt = 0x1; status = 0xF3; d1 = msg->data[0]; break;
+        case MM_TUNE_REQUEST:      mt = 0x1; status = 0xF6; break;
+        case MM_CLOCK:             mt = 0x1; status = 0xF8; break;
+        case MM_START:             mt = 0x1; status = 0xFA; break;
+        case MM_CONTINUE:          mt = 0x1; status = 0xFB; break;
+        case MM_STOP:              mt = 0x1; status = 0xFC; break;
+        case MM_ACTIVE_SENSE:      mt = 0x1; status = 0xFE; break;
+        case MM_RESET:             mt = 0x1; status = 0xFF; break;
+        default: return 0;
+    }
+
+    memset(pkt, 0, sizeof(*pkt));
+    pkt->word_count = 1;
+    pkt->words[0] = ((uint32_t)mt << 28) | ((uint32_t)(group & 0x0F) << 24)
+                  | ((uint32_t)status << 16) | ((uint32_t)d1 << 8) | d2;
+    return 1;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -675,6 +814,10 @@ mm_result mm_context_uninit(mm_context* ctx) {
     if (!ctx || !ctx->initialized) return MM_INVALID_ARG;
     MIDIClientDispose(ctx->cm.client); ctx->initialized = 0; return MM_SUCCESS;
 }
+uint32_t mm_context_caps(mm_context* ctx) {
+    (void)ctx;
+    return MM_CAP_MIDI1 | MM_CAP_VIRTUAL_IN | MM_CAP_VIRTUAL_OUT;
+}
 
 uint32_t mm_in_count (mm_context* ctx) { (void)ctx; return (uint32_t)MIDIGetNumberOfSources();      }
 uint32_t mm_out_count(mm_context* ctx) { (void)ctx; return (uint32_t)MIDIGetNumberOfDestinations();  }
@@ -716,6 +859,12 @@ mm_result mm_in_open(mm_context* ctx, mm_device* dev, uint32_t idx,
     CFRelease(cfport);
     if (st != noErr) return MM_ERROR;
     dev->is_open=1; return MM_SUCCESS;
+}
+mm_result mm_in_open_ump(mm_context* ctx, mm_device* dev, uint32_t idx,
+                         mm_ump_callback cb, void* ud)
+{
+    (void)ctx; (void)dev; (void)idx; (void)cb; (void)ud;
+    return MM_NO_BACKEND;
 }
 mm_result mm_in_start(mm_device* dev) {
     if (!dev||!dev->is_open||!dev->is_input) return MM_NOT_OPEN;
@@ -805,6 +954,10 @@ mm_result mm_out_send_sysex(mm_device* dev, const uint8_t* data, size_t size) {
     dev->cm.sysex_req.completionRefCon = NULL;
     return (MIDISendSysex(&dev->cm.sysex_req) == noErr) ? MM_SUCCESS : MM_ERROR;
 }
+mm_result mm_out_send_ump(mm_device* dev, const mm_ump_packet* pkt) {
+    (void)dev; (void)pkt;
+    return MM_NO_BACKEND;
+}
 mm_result mm_out_close(mm_device* dev) {
     if (!dev||!dev->is_open) return MM_NOT_OPEN;
     if (dev->is_virtual) {
@@ -870,6 +1023,10 @@ mm_result mm_context_init(mm_context* ctx, const char* name) {
        hardware port it opens.                                                 */
 }
 mm_result mm_context_uninit(mm_context* ctx) { if(!ctx)return MM_INVALID_ARG; ctx->initialized=0; return MM_SUCCESS; }
+uint32_t mm_context_caps(mm_context* ctx) {
+    (void)ctx;
+    return MM_CAP_MIDI1;
+}
 
 uint32_t mm_in_count (mm_context* ctx) { (void)ctx; return (uint32_t)midiInGetNumDevs();  }
 uint32_t mm_out_count(mm_context* ctx) { (void)ctx; return (uint32_t)midiOutGetNumDevs(); }
@@ -962,6 +1119,12 @@ mm_result mm_in_open(mm_context* ctx, mm_device* dev, uint32_t idx,
     midiInAddBuffer(dev->wm.in,&dev->wm.sysex_hdr,sizeof(MIDIHDR));
     dev->is_open=1; return MM_SUCCESS;
 }
+mm_result mm_in_open_ump(mm_context* ctx, mm_device* dev, uint32_t idx,
+                         mm_ump_callback cb, void* ud)
+{
+    (void)ctx; (void)dev; (void)idx; (void)cb; (void)ud;
+    return MM_NO_BACKEND;
+}
 mm_result mm_in_start(mm_device* dev) {
     if (!dev||!dev->is_open||!dev->is_input) return MM_NOT_OPEN;
     return (midiInStart(dev->wm.in)==MMSYSERR_NOERROR)?MM_SUCCESS:MM_ERROR;
@@ -1030,6 +1193,10 @@ mm_result mm_out_send_sysex(mm_device* dev, const uint8_t* data, size_t size) {
            ==MIDIERR_STILLPLAYING) Sleep(1);
     return (r==MMSYSERR_NOERROR)?MM_SUCCESS:MM_ERROR;
 }
+mm_result mm_out_send_ump(mm_device* dev, const mm_ump_packet* pkt) {
+    (void)dev; (void)pkt;
+    return MM_NO_BACKEND;
+}
 mm_result mm_out_close(mm_device* dev) {
     if (!dev||!dev->is_open) return MM_NOT_OPEN;
     midiOutClose(dev->wm.out); dev->is_open=0; return MM_SUCCESS;
@@ -1059,6 +1226,12 @@ mm_result mm_out_open_virtual(mm_context* ctx, mm_device* dev)
 #include <unistd.h>
 #include <errno.h>
 
+#if defined(SND_SEQ_EVENT_UMP) && defined(SND_SEQ_PORT_TYPE_MIDI_UMP) && defined(SND_SEQ_PORT_CAP_UMP_ENDPOINT)
+#  define MM_ALSA_HAS_UMP 1
+#else
+#  define MM_ALSA_HAS_UMP 0
+#endif
+
 mm_result mm_context_init(mm_context* ctx, const char* name) {
     if (!ctx) return MM_INVALID_ARG;
     memset(ctx, 0, sizeof(*ctx));
@@ -1074,6 +1247,14 @@ mm_result mm_context_uninit(mm_context* ctx) {
     if (!ctx||!ctx->initialized) return MM_INVALID_ARG;
     snd_seq_close(ctx->al.seq);
     ctx->initialized = 0; return MM_SUCCESS;
+}
+uint32_t mm_context_caps(mm_context* ctx) {
+    (void)ctx;
+    uint32_t caps = MM_CAP_MIDI1 | MM_CAP_VIRTUAL_IN | MM_CAP_VIRTUAL_OUT;
+#if MM_ALSA_HAS_UMP
+    caps |= MM_CAP_UMP | MM_CAP_MIDI2;
+#endif
+    return caps;
 }
 
 /* ── Port enumeration ────────────────────────────────────────────────────────
@@ -1182,6 +1363,34 @@ static void* mm__alsa_recv_thread(void* arg)
            actually queries the kernel — without this, virtual-port events
            sit in the kernel ring and the pending count reads as 0.          */
         while (snd_seq_event_input_pending(al->seq, 1) > 0) {
+#if MM_ALSA_HAS_UMP
+            if (dev->is_ump) {
+                snd_seq_ump_event_t* uev = NULL;
+                int rc = snd_seq_ump_event_input(al->seq, &uev);
+                if (rc == -EAGAIN || rc == -ENOSPC) break;
+                if (rc < 0 || !uev) break;
+
+                if (uev->flags & SND_SEQ_EVENT_UMP) {
+                    mm_ump_packet pkt; memset(&pkt, 0, sizeof(pkt));
+                    uint8_t mt = (uint8_t)((uev->ump[0] >> 28) & 0x0F);
+                    pkt.word_count = mm__ump_word_count_from_type(mt);
+                    if (pkt.word_count > 0) {
+                        memcpy(pkt.words, uev->ump,
+                               (size_t)pkt.word_count * sizeof(uint32_t));
+                        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+                        pkt.timestamp = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+                        if (dev->ump_callback)
+                            dev->ump_callback(dev, &pkt, dev->userdata);
+                        if (dev->callback) {
+                            mm_message translated;
+                            if (mm__ump_midi1_to_message(&pkt, &translated))
+                                dev->callback(dev, &translated, dev->userdata);
+                        }
+                    }
+                }
+                continue;
+            }
+#endif
             snd_seq_event_t* ev = NULL;
             int rc = snd_seq_event_input(al->seq, &ev);
             if (rc == -EAGAIN || rc == -ENOSPC) break; /* nothing left */
@@ -1335,6 +1544,44 @@ mm_result mm_in_open(mm_context* ctx, mm_device* dev, uint32_t idx,
     dev->is_open=1; return MM_SUCCESS;
 }
 
+mm_result mm_in_open_ump(mm_context* ctx, mm_device* dev, uint32_t idx,
+                         mm_ump_callback cb, void* ud)
+{
+#if MM_ALSA_HAS_UMP
+    if (!ctx||!ctx->initialized||!dev||!cb) return MM_INVALID_ARG;
+    mm__alsa_pl lst;
+    mm__alsa_enum(ctx, &lst,
+        SND_SEQ_PORT_CAP_READ|SND_SEQ_PORT_CAP_SUBS_READ,
+        SND_SEQ_PORT_CAP_READ);
+    if (idx >= lst.count) return MM_OUT_OF_RANGE;
+
+    if (snd_seq_set_client_midi_version(ctx->al.seq,
+            SND_SEQ_CLIENT_UMP_MIDI_2_0) < 0)
+        return MM_NO_BACKEND;
+    snd_seq_set_client_ump_conversion(ctx->al.seq, 0);
+
+    memset(dev,0,sizeof(*dev));
+    dev->ctx=ctx; dev->ump_callback=cb; dev->userdata=ud;
+    dev->is_input=1; dev->is_ump=1;
+    dev->al.target_client = lst.ports[idx].client;
+    dev->al.target_port   = lst.ports[idx].port;
+
+    if (pipe(dev->al.wake_pipe) != 0) return MM_ERROR;
+
+    char portname[80]; snprintf(portname, sizeof(portname), "%s-ump-in", ctx->name);
+    dev->al.port_id = snd_seq_create_simple_port(ctx->al.seq, portname,
+        SND_SEQ_PORT_CAP_WRITE|SND_SEQ_PORT_CAP_SUBS_WRITE,
+        SND_SEQ_PORT_TYPE_APPLICATION|SND_SEQ_PORT_TYPE_MIDI_UMP);
+    if (dev->al.port_id < 0) {
+        close(dev->al.wake_pipe[0]); close(dev->al.wake_pipe[1]); return MM_ERROR;
+    }
+    dev->is_open=1; return MM_SUCCESS;
+#else
+    (void)ctx; (void)dev; (void)idx; (void)cb; (void)ud;
+    return MM_NO_BACKEND;
+#endif
+}
+
 mm_result mm_in_start(mm_device* dev) {
     if (!dev||!dev->is_open||!dev->is_input) return MM_NOT_OPEN;
     if (dev->al.thread_started) return MM_ALREADY_OPEN;
@@ -1450,6 +1697,33 @@ mm_result mm_out_send(mm_device* dev, const mm_message* msg) {
         default: return MM_INVALID_ARG;
     }
     mm__alsa_send_ev(dev,&ev); return MM_SUCCESS;
+}
+
+mm_result mm_out_send_ump(mm_device* dev, const mm_ump_packet* pkt) {
+#if MM_ALSA_HAS_UMP
+    if (!dev||!dev->is_open||dev->is_input) return MM_NOT_OPEN;
+    if (!pkt||pkt->word_count < 1||pkt->word_count > 4) return MM_INVALID_ARG;
+    uint8_t mt = (uint8_t)((pkt->words[0] >> 28) & 0x0F);
+    uint8_t expected = mm__ump_word_count_from_type(mt);
+    if (expected == 0 || pkt->word_count != expected) return MM_INVALID_ARG;
+
+    snd_seq_set_client_midi_version(dev->ctx->al.seq, SND_SEQ_CLIENT_UMP_MIDI_2_0);
+    snd_seq_set_client_ump_conversion(dev->ctx->al.seq, 0);
+
+    snd_seq_ump_event_t ev; memset(&ev,0,sizeof(ev));
+    if (snd_seq_ev_set_ump_data(&ev, (void*)pkt->words,
+            (size_t)pkt->word_count * sizeof(uint32_t)) < 0)
+        return MM_INVALID_ARG;
+    snd_seq_ev_set_direct((snd_seq_event_t*)&ev);
+    snd_seq_ev_set_source((snd_seq_event_t*)&ev, dev->al.port_id);
+    snd_seq_ev_set_subs((snd_seq_event_t*)&ev);
+    snd_seq_ump_event_output(dev->ctx->al.seq, &ev);
+    snd_seq_drain_output(dev->ctx->al.seq);
+    return MM_SUCCESS;
+#else
+    (void)dev; (void)pkt;
+    return MM_NO_BACKEND;
+#endif
 }
 
 mm_result mm_out_send_sysex(mm_device* dev, const uint8_t* data, size_t size) {
@@ -1762,6 +2036,10 @@ mm_result mm_context_uninit(mm_context* ctx) {
     if (!ctx||!ctx->initialized) return MM_INVALID_ARG;
     ctx->initialized = 0; return MM_SUCCESS;
 }
+uint32_t mm_context_caps(mm_context* ctx) {
+    (void)ctx;
+    return MM_CAP_MIDI1;
+}
 
 uint32_t mm_in_count(mm_context* ctx) {
     if (!ctx||!ctx->initialized) return 0;
@@ -1788,6 +2066,13 @@ mm_result mm_in_open(mm_context* ctx, mm_device* dev, uint32_t idx,
     memset(dev,0,sizeof(*dev));
     dev->ctx=ctx; dev->callback=cb; dev->userdata=ud; dev->is_input=1;
     dev->web.input_idx=(int)idx; dev->is_open=1; return MM_SUCCESS;
+}
+
+mm_result mm_in_open_ump(mm_context* ctx, mm_device* dev, uint32_t idx,
+                         mm_ump_callback cb, void* ud)
+{
+    (void)ctx; (void)dev; (void)idx; (void)cb; (void)ud;
+    return MM_NO_BACKEND;
 }
 
 mm_result mm_in_start(mm_device* dev) {
@@ -1847,6 +2132,11 @@ mm_result mm_out_send(mm_device* dev, const mm_message* msg) {
         default: return MM_INVALID_ARG;
     }
     return (mm_result)mm__web_out_send_raw_js(dev->web.output_idx, raw, len);
+}
+
+mm_result mm_out_send_ump(mm_device* dev, const mm_ump_packet* pkt) {
+    (void)dev; (void)pkt;
+    return MM_NO_BACKEND;
 }
 
 mm_result mm_out_send_sysex(mm_device* dev, const uint8_t* data, size_t size) {
