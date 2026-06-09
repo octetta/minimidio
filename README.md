@@ -2,6 +2,8 @@
 
 # minimidio
 
+[![CodeFactor](https://www.codefactor.io/repository/github/octetta/minimidio/badge)](https://www.codefactor.io/repository/github/octetta/minimidio)
+
 > Single-file, cross-platform C header library for MIDI input/output.
 > Modelled after [miniaudio](https://miniaud.io/).
 
