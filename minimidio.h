@@ -1182,7 +1182,7 @@ mm_result mm_context_init(mm_context* ctx, const char* name) {
 mm_result mm_context_uninit(mm_context* ctx) { if(!ctx)return MM_INVALID_ARG; ctx->initialized=0; return MM_SUCCESS; }
 uint32_t mm_context_caps(mm_context* ctx) {
     (void)ctx;
-    return MM_CAP_MIDI1;
+    return MM_CAP_MIDI1 | MM_CAP_RAW;
 }
 
 uint32_t mm_in_count (mm_context* ctx) { (void)ctx; return (uint32_t)midiInGetNumDevs();  }
@@ -1201,10 +1201,45 @@ mm_result mm_out_name(mm_context* ctx, uint32_t idx, char* buf, size_t sz) {
     strncpy(buf,c.szPname,sz-1); buf[sz-1]='\0'; return MM_SUCCESS;
 }
 
+/* Number of data bytes that follow a given status byte (raw framing) —
+   same table as CoreMIDI's mm__cm_raw_data_bytes. */
+static int mm__wm_raw_data_bytes(uint8_t status) {
+    if (status >= 0x80 && status <= 0xBF) return 2;  /* note off/on, poly, CC */
+    if (status >= 0xC0 && status <= 0xDF) return 1;  /* prog change, chan press */
+    if (status >= 0xE0 && status <= 0xEF) return 2;  /* pitch bend */
+    switch (status) {
+        case 0xF1: return 1;  /* MTC quarter frame */
+        case 0xF2: return 2;  /* song position */
+        case 0xF3: return 1;  /* song select */
+        default:   return 0;  /* tune request, real-time, undefined */
+    }
+}
+
 static void CALLBACK mm__wm_in_proc(HMIDIIN hmi, UINT wmsg,
                                      DWORD_PTR inst, DWORD_PTR p1, DWORD_PTR p2)
 {
     mm_device* dev = (mm_device*)inst; (void)hmi;
+    /* Raw mode: forward exact wire bytes via raw_callback, before the struct
+       guard. MIM_DATA carries one packed short message; MIM_LONGDATA a SysEx. */
+    if (dev && dev->is_raw) {
+        if (!dev->raw_callback) return;
+        double ts = (double)p2 / 1000.0;
+        if (wmsg == MIM_DATA) {
+            uint8_t wire[3];
+            wire[0] = (uint8_t)( p1        & 0xFF);
+            wire[1] = (uint8_t)((p1 >>  8) & 0xFF);
+            wire[2] = (uint8_t)((p1 >> 16) & 0xFF);
+            size_t n = (size_t)(1 + mm__wm_raw_data_bytes(wire[0]));
+            dev->raw_callback(dev, wire, n, ts, dev->userdata);
+        } else if (wmsg == MIM_LONGDATA) {
+            MIDIHDR* hdr = (MIDIHDR*)p1;
+            if (hdr && hdr->dwBytesRecorded > 0)
+                dev->raw_callback(dev, (const uint8_t*)hdr->lpData,
+                                  (size_t)hdr->dwBytesRecorded, ts, dev->userdata);
+            midiInAddBuffer(dev->wm.in, hdr, sizeof(MIDIHDR));
+        }
+        return;
+    }
     if (!dev || !dev->callback) return;
 
     if (wmsg == MIM_DATA) {
@@ -1282,14 +1317,68 @@ mm_result mm_in_open_ump(mm_context* ctx, mm_device* dev, uint32_t idx,
     (void)ctx; (void)dev; (void)idx; (void)cb; (void)ud;
     return MM_NO_BACKEND;
 }
+/* Raw input: mirrors mm_in_open but routes through the raw callback.
+   mm__wm_in_proc branches on is_raw and forwards exact wire bytes. */
 mm_result mm_in_open_raw(mm_context* ctx, mm_device* dev, uint32_t idx,
                          mm_raw_callback cb, void* ud)
-{ (void)ctx; (void)dev; (void)idx; (void)cb; (void)ud; return MM_NO_BACKEND; }
+{
+    if (!ctx||!dev||!cb) return MM_INVALID_ARG;
+    memset(dev,0,sizeof(*dev)); dev->ctx=ctx; dev->raw_callback=cb; dev->is_raw=1;
+    dev->userdata=ud; dev->is_input=1;
+    if (midiInOpen(&dev->wm.in,(UINT)idx,(DWORD_PTR)mm__wm_in_proc,(DWORD_PTR)dev,
+                   CALLBACK_FUNCTION) != MMSYSERR_NOERROR) return MM_ERROR;
+    memset(&dev->wm.sysex_hdr,0,sizeof(dev->wm.sysex_hdr));
+    dev->wm.sysex_hdr.lpData=(LPSTR)dev->wm.sysex_buf;
+    dev->wm.sysex_hdr.dwBufferLength=MM_SYSEX_BUF_SIZE;
+    midiInPrepareHeader(dev->wm.in,&dev->wm.sysex_hdr,sizeof(MIDIHDR));
+    midiInAddBuffer(dev->wm.in,&dev->wm.sysex_hdr,sizeof(MIDIHDR));
+    dev->is_open=1; return MM_SUCCESS;
+}
+/* No virtual ports in WinMM — intentional MM_NO_BACKEND stub. */
 mm_result mm_in_open_virtual_raw(mm_context* ctx, mm_device* dev,
                                  mm_raw_callback cb, void* ud)
 { (void)ctx; (void)dev; (void)cb; (void)ud; return MM_NO_BACKEND; }
+/* Raw output: byte-exact, no cap. Walk the buffer, framing each message — short
+   messages packed into midiOutShortMsg, a whole F0..F7 sent via midiOutLongMsg
+   (heap buffer sized to the payload, so there is no fixed length cap). */
 mm_result mm_out_send_raw(mm_device* dev, const uint8_t* data, size_t len)
-{ (void)dev; (void)data; (void)len; return MM_NO_BACKEND; }
+{
+    if (!dev||!dev->is_open||dev->is_input) return MM_NOT_OPEN;
+    if (!data||!len) return MM_INVALID_ARG;
+    size_t off = 0;
+    while (off < len) {
+        uint8_t s = data[off];
+        if (s == 0xF0) {                       /* SysEx: scan to F7 (or buffer end) */
+            size_t end = off + 1;
+            while (end < len && data[end] != 0xF7) end++;
+            if (end < len) end++;              /* include the terminating F7 */
+            size_t sxlen = end - off;
+            char* sx = (char*)malloc(sxlen);
+            if (!sx) return MM_ALLOC_FAILED;
+            memcpy(sx, data + off, sxlen);
+            MIDIHDR hdr; memset(&hdr,0,sizeof(hdr));
+            hdr.lpData=(LPSTR)sx; hdr.dwBufferLength=(DWORD)sxlen;
+            hdr.dwBytesRecorded=(DWORD)sxlen;
+            midiOutPrepareHeader(dev->wm.out,&hdr,sizeof(MIDIHDR));
+            MMRESULT r=midiOutLongMsg(dev->wm.out,&hdr,sizeof(MIDIHDR));
+            while (midiOutUnprepareHeader(dev->wm.out,&hdr,sizeof(MIDIHDR))
+                   ==MIDIERR_STILLPLAYING) Sleep(1);
+            free(sx);
+            if (r != MMSYSERR_NOERROR) return MM_ERROR;
+            off = end;
+        } else if (s >= 0x80) {                /* status: pack status + data bytes */
+            int nd = mm__wm_raw_data_bytes(s);
+            DWORD pk = s;
+            if (nd >= 1 && off + 1 < len) pk |= (DWORD)data[off+1] << 8;
+            if (nd >= 2 && off + 2 < len) pk |= (DWORD)data[off+2] << 16;
+            if (midiOutShortMsg(dev->wm.out, pk) != MMSYSERR_NOERROR) return MM_ERROR;
+            off += (size_t)(1 + nd);
+        } else {
+            off++;                             /* stray data byte — skip */
+        }
+    }
+    return MM_SUCCESS;
+}
 mm_result mm_in_start(mm_device* dev) {
     if (!dev||!dev->is_open||!dev->is_input) return MM_NOT_OPEN;
     return (midiInStart(dev->wm.in)==MMSYSERR_NOERROR)?MM_SUCCESS:MM_ERROR;
@@ -2233,6 +2322,14 @@ EM_JS(int, mm__web_out_send_raw_js, (int idx, const uint8_t* data, int size), {
 static void mm__web_dispatch_raw(uintptr_t devp, double ts, const uint8_t* data, int size)
 {
     mm_device* dev = (mm_device*)devp;
+    /* Raw mode: the Web MIDI API delivers exactly one complete message per
+       event, so data[0..size) is already one framed message — forward verbatim,
+       no framing, never touching dev->callback (NULL in raw mode). */
+    if (dev && dev->is_raw) {
+        if (dev->raw_callback && data && size > 0)
+            dev->raw_callback(dev, data, (size_t)size, ts, dev->userdata);
+        return;
+    }
     if (!dev || !dev->callback || !data || size <= 0) return;
 
     int j = 0;
@@ -2332,7 +2429,7 @@ mm_result mm_context_uninit(mm_context* ctx) {
 }
 uint32_t mm_context_caps(mm_context* ctx) {
     (void)ctx;
-    return MM_CAP_MIDI1;
+    return MM_CAP_MIDI1 | MM_CAP_RAW;
 }
 
 uint32_t mm_in_count(mm_context* ctx) {
@@ -2369,15 +2466,28 @@ mm_result mm_in_open_ump(mm_context* ctx, mm_device* dev, uint32_t idx,
     return MM_NO_BACKEND;
 }
 
-/* Raw I/O is implemented for Web MIDI in a later slice; stub for now. */
+/* Raw input: mirrors mm_in_open but routes through the raw callback. The Web
+   MIDI dispatch (mm__web_dispatch_raw) branches on is_raw and forwards bytes. */
 mm_result mm_in_open_raw(mm_context* ctx, mm_device* dev, uint32_t idx,
                          mm_raw_callback cb, void* ud)
-{ (void)ctx; (void)dev; (void)idx; (void)cb; (void)ud; return MM_NO_BACKEND; }
+{
+    if (!ctx||!ctx->initialized||!dev||!cb) return MM_INVALID_ARG;
+    if (idx >= mm_in_count(ctx)) return MM_OUT_OF_RANGE;
+    memset(dev,0,sizeof(*dev));
+    dev->ctx=ctx; dev->raw_callback=cb; dev->is_raw=1; dev->userdata=ud; dev->is_input=1;
+    dev->web.input_idx=(int)idx; dev->is_open=1; return MM_SUCCESS;
+}
+/* No virtual ports in the Web MIDI API — intentional MM_NO_BACKEND stub. */
 mm_result mm_in_open_virtual_raw(mm_context* ctx, mm_device* dev,
                                  mm_raw_callback cb, void* ud)
 { (void)ctx; (void)dev; (void)cb; (void)ud; return MM_NO_BACKEND; }
+/* Raw output: byte-exact, forwarded to the same JS sender mm_out_send uses. */
 mm_result mm_out_send_raw(mm_device* dev, const uint8_t* data, size_t len)
-{ (void)dev; (void)data; (void)len; return MM_NO_BACKEND; }
+{
+    if (!dev||!dev->is_open||dev->is_input) return MM_NOT_OPEN;
+    if (!data||!len) return MM_INVALID_ARG;
+    return (mm_result)mm__web_out_send_raw_js(dev->web.output_idx, data, (int)len);
+}
 
 mm_result mm_in_start(mm_device* dev) {
     if (!dev||!dev->is_open||!dev->is_input) return MM_NOT_OPEN;
