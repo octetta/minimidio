@@ -337,6 +337,7 @@ enum {
     MM_CAP_MIDI2        = 1u << 2,  /* Backend can opt into MIDI 2.0 UMP mode */
     MM_CAP_VIRTUAL_IN   = 1u << 3,
     MM_CAP_VIRTUAL_OUT  = 1u << 4,
+    MM_CAP_RAW          = 1u << 5,  /* Raw byte-transparent I/O */
 };
 
 typedef struct mm_ump_packet {
@@ -354,6 +355,10 @@ typedef struct mm_device  mm_device;
 typedef void (*mm_callback)(mm_device* dev, const mm_message* msg, void* userdata);
 typedef void (*mm_ump_callback)(mm_device* dev, const mm_ump_packet* pkt,
                                 void* userdata);
+/* Raw inbound: deliver the exact wire bytes for one complete message. */
+typedef void (*mm_raw_callback)(mm_device* dev,
+                                const uint8_t* data, size_t len,
+                                double timestamp, void* userdata);
 
 /* ══════════════════════════════════════════════════════════════════════════════
    MTC utilities — header-only, always available
@@ -441,12 +446,13 @@ static inline mm_message mm_make_message(uint8_t status, uint8_t d1, uint8_t d2)
 
 typedef struct { MIDIClientRef client; } mm__ctx_coremidi;
 
-typedef struct {
+typedef struct mm__dev_coremidi {
     MIDIPortRef          port;       /* non-virtual: the port we created     */
     MIDIEndpointRef      endpoint;   /* non-virtual: the hardware endpoint   */
     MIDIEndpointRef      virt_ep;    /* virtual: the endpoint we OWN        */
     MIDISysexSendRequest sysex_req;
     uint8_t              sysex_buf[MM_SYSEX_BUF_SIZE];
+    size_t               sysex_pos;  /* raw path: cross-packet SysEx accumulator */
 } mm__dev_coremidi;
 
 #elif defined(MM_BACKEND_WINMM)
@@ -527,11 +533,13 @@ struct mm_device {
     mm_context* ctx;
     mm_callback callback;
     mm_ump_callback ump_callback;
+    mm_raw_callback raw_callback;
     void*       userdata;
     int         is_input;
     int         is_open;
     int         is_virtual;  /* 1 = opened with mm_in/out_open_virtual */
     int         is_ump;      /* 1 = opened with mm_in_open_ump */
+    int             is_raw;  /* 1 = opened with mm_in_open_raw / _virtual_raw */
 #if defined(MM_BACKEND_COREMIDI)
     mm__dev_coremidi cm;
 #elif defined(MM_BACKEND_WINMM)
@@ -565,6 +573,12 @@ mm_result   mm_in_open  (mm_context* ctx, mm_device* dev, uint32_t idx,
                          mm_callback cb, void* userdata);
 mm_result   mm_in_open_ump(mm_context* ctx, mm_device* dev, uint32_t idx,
                            mm_ump_callback cb, void* userdata);
+/* Raw input: deliver the exact wire bytes, one complete message per callback.
+   Byte-transparent — no velocity-0 folding, no status normalization. Opens
+   exactly like mm_in_open; start/stop/close are shared with the struct path.
+   Returns MM_NO_BACKEND on backends that do not yet implement raw I/O.        */
+mm_result   mm_in_open_raw(mm_context* ctx, mm_device* dev, uint32_t idx,
+                           mm_raw_callback cb, void* userdata);
 mm_result   mm_in_start (mm_device* dev);
 mm_result   mm_in_stop  (mm_device* dev);
 mm_result   mm_in_close (mm_device* dev);
@@ -577,10 +591,20 @@ mm_result   mm_in_close (mm_device* dev);
 mm_result   mm_in_open_virtual(mm_context* ctx, mm_device* dev,
                                 mm_callback cb, void* userdata);
 
+/* Raw virtual input: byte-transparent twin of mm_in_open_virtual. Creates a
+   named destination other apps send into; bytes reach the raw callback intact.
+   On Windows/WinMM and Web MIDI returns MM_NO_BACKEND (no virtual ports).      */
+mm_result   mm_in_open_virtual_raw(mm_context* ctx, mm_device* dev,
+                                   mm_raw_callback cb, void* userdata);
+
 mm_result   mm_out_open      (mm_context* ctx, mm_device* dev, uint32_t idx);
 mm_result   mm_out_send      (mm_device* dev, const mm_message* msg);
 mm_result   mm_out_send_ump  (mm_device* dev, const mm_ump_packet* pkt);
 mm_result   mm_out_send_sysex(mm_device* dev, const uint8_t* data, size_t size);
+/* Raw output: transmit an arbitrary byte buffer, byte-exact, with NO length
+   cap (large SysEx to a virtual source works). Returns MM_NO_BACKEND on
+   backends that do not yet implement raw I/O.                                  */
+mm_result   mm_out_send_raw  (mm_device* dev, const uint8_t* data, size_t len);
 mm_result   mm_out_close     (mm_device* dev);
 
 /* Virtual output: creates a named source that OTHER apps can read from.
@@ -715,9 +739,88 @@ static double mm__cm_ts(MIDITimeStamp ts) {
     return (double)ts * tb.numer / tb.denom * 1e-9;
 }
 
+/* Number of data bytes that follow a given status byte (raw framing). */
+static int mm__cm_raw_data_bytes(uint8_t status) {
+    if (status >= 0x80 && status <= 0xBF) return 2;  /* note off/on, poly, CC */
+    if (status >= 0xC0 && status <= 0xDF) return 1;  /* prog change, chan press */
+    if (status >= 0xE0 && status <= 0xEF) return 2;  /* pitch bend */
+    switch (status) {
+        case 0xF1: return 1;  /* MTC quarter frame */
+        case 0xF2: return 2;  /* song position */
+        case 0xF3: return 1;  /* song select */
+        case 0xF6: return 0;  /* tune request */
+        default:   return 0;  /* 0xF4 / 0xF5 undefined — frame status alone */
+    }
+}
+
+/* Raw inbound framing: deliver the exact wire bytes, one complete message per
+   callback. Honors raw semantic rules — byte-exact (no folding), whole SysEx
+   reassembled across packets, and system real-time (>= 0xF8) delivered as its
+   own single-byte callback (even mid-SysEx) and excluded from the SysEx body.  */
+static void mm__cm_raw_dispatch(const MIDIPacketList* pl, mm_device* dev)
+{
+    mm_raw_callback cb = dev->raw_callback;
+    if (!cb) return;
+    void* ud = dev->userdata;
+
+    const MIDIPacket* pkt = &pl->packet[0];
+    for (UInt32 i = 0; i < pl->numPackets; i++) {
+        double ts = mm__cm_ts(pkt->timeStamp);
+        UInt16 len = pkt->length;
+        for (UInt16 j = 0; j < len; j++) {
+            uint8_t b = pkt->data[j];
+
+            /* System real-time — own 1-byte callback, even mid-SysEx */
+            if (b >= 0xF8) {
+                cb(dev, &pkt->data[j], 1, ts, ud);
+                continue;
+            }
+
+            /* Inside a SysEx in progress (may span packets / callbacks) */
+            if (dev->cm.sysex_pos > 0) {
+                if (dev->cm.sysex_pos >= MM_SYSEX_BUF_SIZE) {
+                    dev->cm.sysex_pos = 0;   /* overflow — drop the runaway SysEx */
+                    continue;
+                }
+                dev->cm.sysex_buf[dev->cm.sysex_pos++] = b;
+                if (b == 0xF7) {
+                    cb(dev, dev->cm.sysex_buf, dev->cm.sysex_pos, ts, ud);
+                    dev->cm.sysex_pos = 0;
+                }
+                continue;
+            }
+
+            /* SysEx start — begin accumulation */
+            if (b == 0xF0) {
+                dev->cm.sysex_buf[0] = b;
+                dev->cm.sysex_pos = 1;
+                continue;
+            }
+
+            /* Status byte — emit status + N data bytes from this packet */
+            if (b >= 0x80) {
+                int n = mm__cm_raw_data_bytes(b);
+                uint8_t msg[3];
+                int mlen = 0;
+                msg[mlen++] = b;
+                while (mlen <= n && (j + 1) < len) {
+                    msg[mlen++] = pkt->data[++j];
+                }
+                cb(dev, msg, (size_t)mlen, ts, ud);
+                continue;
+            }
+
+            /* Data byte with no preceding status (running status / stray) —
+               mirror the struct read proc's existing choice: skip it. */
+        }
+        pkt = MIDIPacketNext(pkt);
+    }
+}
+
 static void mm__cm_read_proc(const MIDIPacketList* pl, void* ref, void* src)
 {
     mm_device* dev = (mm_device*)ref; (void)src;
+    if (dev && dev->is_raw) { mm__cm_raw_dispatch(pl, dev); return; }
     if (!dev || !dev->callback) return;
 
     const MIDIPacket* pkt = &pl->packet[0];
@@ -816,7 +919,7 @@ mm_result mm_context_uninit(mm_context* ctx) {
 }
 uint32_t mm_context_caps(mm_context* ctx) {
     (void)ctx;
-    return MM_CAP_MIDI1 | MM_CAP_VIRTUAL_IN | MM_CAP_VIRTUAL_OUT;
+    return MM_CAP_MIDI1 | MM_CAP_VIRTUAL_IN | MM_CAP_VIRTUAL_OUT | MM_CAP_RAW;
 }
 
 uint32_t mm_in_count (mm_context* ctx) { (void)ctx; return (uint32_t)MIDIGetNumberOfSources();      }
@@ -865,6 +968,22 @@ mm_result mm_in_open_ump(mm_context* ctx, mm_device* dev, uint32_t idx,
 {
     (void)ctx; (void)dev; (void)idx; (void)cb; (void)ud;
     return MM_NO_BACKEND;
+}
+mm_result mm_in_open_raw(mm_context* ctx, mm_device* dev, uint32_t idx,
+                         mm_raw_callback cb, void* ud)
+{
+    if (!ctx||!dev||!cb) return MM_INVALID_ARG;
+    if (idx >= MIDIGetNumberOfSources()) return MM_OUT_OF_RANGE;
+    memset(dev, 0, sizeof(*dev));
+    dev->ctx=ctx; dev->raw_callback=cb; dev->is_raw=1; dev->userdata=ud; dev->is_input=1;
+    dev->cm.endpoint = MIDIGetSource(idx);
+    char portname[80]; snprintf(portname, sizeof(portname), "%s-in", ctx->name);
+    CFStringRef cfport = CFStringCreateWithCString(NULL, portname, kCFStringEncodingUTF8);
+    OSStatus st = MIDIInputPortCreate(ctx->cm.client, cfport,
+                                      mm__cm_read_proc, dev, &dev->cm.port);
+    CFRelease(cfport);
+    if (st != noErr) return MM_ERROR;
+    dev->is_open=1; return MM_SUCCESS;
 }
 mm_result mm_in_start(mm_device* dev) {
     if (!dev||!dev->is_open||!dev->is_input) return MM_NOT_OPEN;
@@ -958,6 +1077,25 @@ mm_result mm_out_send_ump(mm_device* dev, const mm_ump_packet* pkt) {
     (void)dev; (void)pkt;
     return MM_NO_BACKEND;
 }
+mm_result mm_out_send_raw(mm_device* dev, const uint8_t* data, size_t len) {
+    if (!dev||!dev->is_open||dev->is_input) return MM_NOT_OPEN;
+    if (!data||!len) return MM_INVALID_ARG;
+    /* Size the packet list to the payload (no stack-sizeof(pl) cap — this is
+       the byte-exact, uncapped path that also resolves the U1 virtual-source
+       SysEx limit). */
+    size_t bufsize = sizeof(MIDIPacketList) + len;
+    Byte* buf = (Byte*)malloc(bufsize);
+    if (!buf) return MM_ALLOC_FAILED;
+    MIDIPacketList* pl = (MIDIPacketList*)buf;
+    MIDIPacket* p = MIDIPacketListInit(pl);
+    p = MIDIPacketListAdd(pl, bufsize, p, 0, (ByteCount)len, data);
+    if (!p) { free(buf); return MM_ERROR; }
+    OSStatus st = dev->is_virtual
+        ? MIDIReceived(dev->cm.virt_ep, pl)
+        : MIDISend(dev->cm.port, dev->cm.endpoint, pl);
+    free(buf);
+    return (st == noErr) ? MM_SUCCESS : MM_ERROR;
+}
 mm_result mm_out_close(mm_device* dev) {
     if (!dev||!dev->is_open) return MM_NOT_OPEN;
     if (dev->is_virtual) {
@@ -978,6 +1116,24 @@ mm_result mm_in_open_virtual(mm_context* ctx, mm_device* dev,
     if (!ctx||!dev||!cb) return MM_INVALID_ARG;
     memset(dev, 0, sizeof(*dev));
     dev->ctx=ctx; dev->callback=cb; dev->userdata=ud;
+    dev->is_input=1; dev->is_virtual=1;
+
+    CFStringRef cfname = CFStringCreateWithCString(NULL, ctx->name,
+                                                    kCFStringEncodingUTF8);
+    OSStatus st = MIDIDestinationCreate(ctx->cm.client, cfname,
+                                        mm__cm_read_proc, dev,
+                                        &dev->cm.virt_ep);
+    CFRelease(cfname);
+    if (st != noErr) return MM_ERROR;
+    dev->is_open=1; return MM_SUCCESS;
+}
+
+mm_result mm_in_open_virtual_raw(mm_context* ctx, mm_device* dev,
+                                 mm_raw_callback cb, void* ud)
+{
+    if (!ctx||!dev||!cb) return MM_INVALID_ARG;
+    memset(dev, 0, sizeof(*dev));
+    dev->ctx=ctx; dev->raw_callback=cb; dev->is_raw=1; dev->userdata=ud;
     dev->is_input=1; dev->is_virtual=1;
 
     CFStringRef cfname = CFStringCreateWithCString(NULL, ctx->name,
@@ -1125,6 +1281,14 @@ mm_result mm_in_open_ump(mm_context* ctx, mm_device* dev, uint32_t idx,
     (void)ctx; (void)dev; (void)idx; (void)cb; (void)ud;
     return MM_NO_BACKEND;
 }
+mm_result mm_in_open_raw(mm_context* ctx, mm_device* dev, uint32_t idx,
+                         mm_raw_callback cb, void* ud)
+{ (void)ctx; (void)dev; (void)idx; (void)cb; (void)ud; return MM_NO_BACKEND; }
+mm_result mm_in_open_virtual_raw(mm_context* ctx, mm_device* dev,
+                                 mm_raw_callback cb, void* ud)
+{ (void)ctx; (void)dev; (void)cb; (void)ud; return MM_NO_BACKEND; }
+mm_result mm_out_send_raw(mm_device* dev, const uint8_t* data, size_t len)
+{ (void)dev; (void)data; (void)len; return MM_NO_BACKEND; }
 mm_result mm_in_start(mm_device* dev) {
     if (!dev||!dev->is_open||!dev->is_input) return MM_NOT_OPEN;
     return (midiInStart(dev->wm.in)==MMSYSERR_NOERROR)?MM_SUCCESS:MM_ERROR;
@@ -1581,6 +1745,16 @@ mm_result mm_in_open_ump(mm_context* ctx, mm_device* dev, uint32_t idx,
     return MM_NO_BACKEND;
 #endif
 }
+
+/* Raw I/O is implemented for ALSA in a later slice; stub for now. */
+mm_result mm_in_open_raw(mm_context* ctx, mm_device* dev, uint32_t idx,
+                         mm_raw_callback cb, void* ud)
+{ (void)ctx; (void)dev; (void)idx; (void)cb; (void)ud; return MM_NO_BACKEND; }
+mm_result mm_in_open_virtual_raw(mm_context* ctx, mm_device* dev,
+                                 mm_raw_callback cb, void* ud)
+{ (void)ctx; (void)dev; (void)cb; (void)ud; return MM_NO_BACKEND; }
+mm_result mm_out_send_raw(mm_device* dev, const uint8_t* data, size_t len)
+{ (void)dev; (void)data; (void)len; return MM_NO_BACKEND; }
 
 mm_result mm_in_start(mm_device* dev) {
     if (!dev||!dev->is_open||!dev->is_input) return MM_NOT_OPEN;
@@ -2074,6 +2248,16 @@ mm_result mm_in_open_ump(mm_context* ctx, mm_device* dev, uint32_t idx,
     (void)ctx; (void)dev; (void)idx; (void)cb; (void)ud;
     return MM_NO_BACKEND;
 }
+
+/* Raw I/O is implemented for Web MIDI in a later slice; stub for now. */
+mm_result mm_in_open_raw(mm_context* ctx, mm_device* dev, uint32_t idx,
+                         mm_raw_callback cb, void* ud)
+{ (void)ctx; (void)dev; (void)idx; (void)cb; (void)ud; return MM_NO_BACKEND; }
+mm_result mm_in_open_virtual_raw(mm_context* ctx, mm_device* dev,
+                                 mm_raw_callback cb, void* ud)
+{ (void)ctx; (void)dev; (void)cb; (void)ud; return MM_NO_BACKEND; }
+mm_result mm_out_send_raw(mm_device* dev, const uint8_t* data, size_t len)
+{ (void)dev; (void)data; (void)len; return MM_NO_BACKEND; }
 
 mm_result mm_in_start(mm_device* dev) {
     if (!dev||!dev->is_open||!dev->is_input) return MM_NOT_OPEN;
