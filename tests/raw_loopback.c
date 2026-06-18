@@ -1,32 +1,36 @@
 /*
-  raw_loopback.c — self-checking loopback harness for the raw-bytes API
-                   (Slice 01, CoreMIDI). Modelled on examples/virtual.c.
+  raw_loopback.c — self-checking loopback harness for the raw-bytes API.
+                   Cross-platform: CoreMIDI (slice 01) and ALSA (slice 02).
 
-  Build (macOS):
-    cc tests/raw_loopback.c -framework CoreMIDI -framework CoreFoundation \
-       -Wall -Wextra -o /tmp/raw_loopback
-
-    NOTE: -framework CoreFoundation is required on the current Xcode CLT;
-    -framework CoreMIDI alone does not re-export the CFString/CFRelease
-    symbols that minimidio's CoreMIDI backend uses (see closing-report,
-    F-8/F-14 amendment).
+  Build:
+    macOS:  cc tests/raw_loopback.c -framework CoreMIDI -framework CoreFoundation \
+                -Wall -Wextra -o /tmp/raw_loopback
+            (-framework CoreFoundation is required on the current Xcode CLT;
+             -framework CoreMIDI alone does not re-export the CFString/CFRelease
+             symbols minimidio's CoreMIDI backend uses — see slice-01 report.)
+    Linux:  cc tests/raw_loopback.c -lasound -lpthread -Wall -Wextra -o /tmp/raw_loopback
 
   Behaviour:
-    Prints exactly one line "PASS T<n>" per passing ledger case to stdout,
-    and exits non-zero (with a FAIL line on stderr) on the first failure.
+    Prints exactly one line "PASS T<n>" per passing ledger case to stdout, and
+    exits non-zero (with a FAIL line on stderr) on the first failure.
 
-  Topology (see slice-doc.md §D7): a single virtual *source* created with
-  mm_out_open_virtual is opened as a raw input via mm_in_open_raw — the input
-  connects to that source, so mm_out_send_raw on the source goes through the
-  virtual MIDIReceived branch (the exact path the >256-byte SysEx must prove).
-  A coverage case exercises mm_in_open_virtual_raw + mm_out_open (MIDISend
-  branch). T6 opens a struct-mode input on the same source to prove the shared
-  read proc still decodes structs.
+  Topology — TWO contexts (a sender client and a receiver client).
+    The single-context "find my own virtual source" wiring used in slice 01 on
+    CoreMIDI does NOT work on ALSA: ALSA's port enumeration deliberately skips
+    the caller's own client, so a virtual source created in a context is invisible
+    to that same context's mm_in_name. Using two contexts (two MIDI clients in one
+    process) makes the source visible cross-client and works identically on both
+    backends. T1-T6 are unchanged in intent; only the wiring uses two clients.
 
-  Intra-process virtual loopback is the one empirically-unproven assumption
-  (slice-doc §D7). If no bytes ever arrive, the harness reports "no bytes
-  received" distinctly from "wrong bytes", so the failure can be triaged as a
-  loopback-topology amendment rather than a logic bug.
+    Primary path (T1-T4, T6): sender `mm_out_open_virtual` (a virtual source) →
+    receiver finds it by name in its input list → `mm_in_open_raw` connects to it
+    → `mm_out_send_raw` on the source is received by the receiver's raw thread.
+    Coverage case: receiver `mm_in_open_virtual_raw` (a virtual destination) +
+    sender `mm_out_open` targeting it → exercises that open + the real-out path.
+
+    Intra-process delivery (CoreMIDI cross-client, ALSA cross-client subscription)
+    is asynchronous on a background thread; the harness waits with usleep and
+    distinguishes "no bytes" from "wrong bytes" so a failure is diagnosable.
 */
 
 #define MINIMIDIO_IMPLEMENTATION
@@ -38,10 +42,11 @@
 #include <unistd.h>
 #include <pthread.h>
 
-#define CTX_NAME       "mmraw-loopback"
+#define TX_NAME        "mmraw-tx"     /* sender context / virtual source name   */
+#define RX_NAME        "mmraw-rx"     /* receiver context / virtual dest name   */
 #define CAP_MAX_MSGS   16
 #define CAP_MSG_BYTES  (MM_SYSEX_BUF_SIZE + 8)
-#define WAIT_MS        2000   /* generous: CoreMIDI delivers on its own thread */
+#define WAIT_MS        2000           /* delivery is async on a background thread */
 
 /* ── Raw capture (byte buffers) ──────────────────────────────────────────── */
 typedef struct {
@@ -79,7 +84,6 @@ static int raw_count(raw_capture* c) {
     return n;
 }
 
-/* Wait until at least `want` messages have arrived, or timeout. */
 static int wait_for_raw(raw_capture* c, int want, int timeout_ms) {
     int waited = 0;
     while (waited < timeout_ms) {
@@ -129,16 +133,16 @@ static void die(const char* test, const char* why) {
     exit(1);
 }
 
-/* Find an endpoint named CTX_NAME in the input (is_in=1) or output list.
-   Returns index, or -1. Retries to allow the OS to register the new endpoint. */
-static int find_endpoint(mm_context* ctx, int is_in) {
+/* Find an endpoint whose name contains `want` in the input (is_in=1) or output
+   list of `ctx`. Retries to allow the OS to register a freshly-created port.   */
+static int find_endpoint(mm_context* ctx, int is_in, const char* want) {
     for (int attempt = 0; attempt < 40; attempt++) {  /* up to ~2s */
         uint32_t n = is_in ? mm_in_count(ctx) : mm_out_count(ctx);
         for (uint32_t i = 0; i < n; i++) {
             char name[128];
             mm_result r = is_in ? mm_in_name(ctx, i, name, sizeof(name))
                                 : mm_out_name(ctx, i, name, sizeof(name));
-            if (r == MM_SUCCESS && strstr(name, CTX_NAME) != NULL)
+            if (r == MM_SUCCESS && strstr(name, want) != NULL)
                 return (int)i;
         }
         usleep(50000);
@@ -154,31 +158,30 @@ int main(void) {
     pthread_mutex_init(&g_raw.lock, NULL);
     pthread_mutex_init(&g_struct.lock, NULL);
 
-    mm_context ctx;
-    mm_result r = mm_context_init(&ctx, CTX_NAME);
-    if (r != MM_SUCCESS) die("init", mm_result_string(r));
+    mm_context tx, rx;   /* sender + receiver clients */
+    if (mm_context_init(&tx, TX_NAME) != MM_SUCCESS) die("init", "tx");
+    if (mm_context_init(&rx, RX_NAME) != MM_SUCCESS) die("init", "rx");
 
-    /* ── T5 / F-13: runtime caps advertise MM_CAP_RAW ── */
-    if ((mm_context_caps(&ctx) & MM_CAP_RAW) == 0)
+    /* ── T5: runtime caps advertise MM_CAP_RAW ── */
+    if ((mm_context_caps(&rx) & MM_CAP_RAW) == 0)
         die("T5", "MM_CAP_RAW not advertised by mm_context_caps");
     printf("PASS T5\n"); fflush(stdout);
 
-    /* ── Primary path: virtual source + raw input connected to it ── */
+    /* ── Primary path: sender virtual source, receiver raw input on it ── */
     mm_device src;
-    r = mm_out_open_virtual(&ctx, &src);
-    if (r != MM_SUCCESS) die("setup", "mm_out_open_virtual failed");
+    if (mm_out_open_virtual(&tx, &src) != MM_SUCCESS)
+        die("setup", "mm_out_open_virtual failed");
 
-    int in_idx = find_endpoint(&ctx, 1);
+    int in_idx = find_endpoint(&rx, 1, TX_NAME);
     if (in_idx < 0) die("setup", "virtual source did not appear in input list");
 
     mm_device in;
-    r = mm_in_open_raw(&ctx, &in, (uint32_t)in_idx, on_raw, &g_raw);
-    if (r != MM_SUCCESS) die("setup", "mm_in_open_raw failed");
-    r = mm_in_start(&in);
-    if (r != MM_SUCCESS) die("setup", "mm_in_start failed");
+    if (mm_in_open_raw(&rx, &in, (uint32_t)in_idx, on_raw, &g_raw) != MM_SUCCESS)
+        die("setup", "mm_in_open_raw failed");
+    if (mm_in_start(&in) != MM_SUCCESS) die("setup", "mm_in_start failed");
     usleep(200000);  /* let the connection settle */
 
-    /* ── T1 / F-9: short channel message round-trips byte-exact ── */
+    /* ── T1: short channel message round-trips byte-exact ── */
     {
         const uint8_t msg[3] = { 0x90, 0x3C, 0x40 };
         raw_reset(&g_raw);
@@ -190,14 +193,14 @@ int main(void) {
         printf("PASS T1\n"); fflush(stdout);
     }
 
-    /* ── T2 / F-10: note-on velocity 0 passes through unfolded ── */
+    /* ── T2: note-on velocity 0 passes through unfolded ── */
     {
         const uint8_t msg[3] = { 0x90, 0x3C, 0x00 };
         raw_reset(&g_raw);
         if (mm_out_send_raw(&src, msg, sizeof(msg)) != MM_SUCCESS)
             die("T2", "mm_out_send_raw returned error");
         if (!wait_for_raw(&g_raw, 1, WAIT_MS)) die("T2", "no bytes received");
-        /* Must stay 90 3C 00 — NOT folded to 80 .. */
+        /* Must stay 90 3C 00 — NOT folded to 80 .. (the ALSA headline) */
         if (g_raw.len[0] != 3 || !bytes_eq(g_raw.bytes[0], msg, 3))
             die("T2", "velocity-0 not byte-exact (folded?)");
         if (g_raw.bytes[0][0] != 0x90)
@@ -205,7 +208,7 @@ int main(void) {
         printf("PASS T2\n"); fflush(stdout);
     }
 
-    /* ── T3 / F-11: >256-byte SysEx round-trips whole, one callback ── */
+    /* ── T3: >256-byte SysEx round-trips whole, one callback ── */
     {
         const size_t N = 300;            /* F0 + 298 data + F7 */
         uint8_t sysex[300];
@@ -225,7 +228,7 @@ int main(void) {
         printf("PASS T3\n"); fflush(stdout);
     }
 
-    /* ── T4 / F-12: F8 mid-SysEx → own 1-byte callback AND clean SysEx ── */
+    /* ── T4: real-time (F8) interleaved with SysEx → own callback + clean SysEx ── */
     {
         /* F0 7E 00 <data> F8 <data> F7 */
         uint8_t buf[16]; size_t k = 0;
@@ -258,19 +261,19 @@ int main(void) {
         printf("PASS T4\n"); fflush(stdout);
     }
 
-    /* ── Coverage: mm_in_open_virtual_raw + mm_out_open (MIDISend branch) ── */
+    /* ── Coverage: mm_in_open_virtual_raw (receiver) + mm_out_open (sender) ── */
     {
         mm_device vdst;
-        r = mm_in_open_virtual_raw(&ctx, &vdst, on_raw, &g_raw);
-        if (r != MM_SUCCESS) die("coverage", "mm_in_open_virtual_raw failed");
-        r = mm_in_start(&vdst);
-        if (r != MM_SUCCESS) die("coverage", "mm_in_start (virtual raw) failed");
+        if (mm_in_open_virtual_raw(&rx, &vdst, on_raw, &g_raw) != MM_SUCCESS)
+            die("coverage", "mm_in_open_virtual_raw failed");
+        if (mm_in_start(&vdst) != MM_SUCCESS)
+            die("coverage", "mm_in_start (virtual raw) failed");
 
-        int out_idx = find_endpoint(&ctx, 0);
+        int out_idx = find_endpoint(&tx, 0, RX_NAME);
         if (out_idx < 0) die("coverage", "virtual destination not in output list");
         mm_device out;
-        r = mm_out_open(&ctx, &out, (uint32_t)out_idx);
-        if (r != MM_SUCCESS) die("coverage", "mm_out_open failed");
+        if (mm_out_open(&tx, &out, (uint32_t)out_idx) != MM_SUCCESS)
+            die("coverage", "mm_out_open failed");
         usleep(200000);
 
         const uint8_t msg[3] = { 0xB0, 0x07, 0x7F };  /* CC volume */
@@ -288,15 +291,21 @@ int main(void) {
         mm_in_close(&vdst);
     }
 
-    /* ── T6 / F-14: struct-mode input on the SAME source still decodes ── */
+    /* Close the raw input before T6: on ALSA all input ports in one client
+       share a single event queue drained by per-input recv threads, so a
+       lingering raw thread would race and steal the struct note. The raw
+       path's work is done by now. (Harmless on CoreMIDI's per-port delivery.) */
+    mm_in_stop(&in);
+    mm_in_close(&in);
+
+    /* ── T6: struct-mode input on the SAME source still decodes ── */
     {
-        int sidx = find_endpoint(&ctx, 1);   /* still the virtual source */
+        int sidx = find_endpoint(&rx, 1, TX_NAME);   /* the virtual source */
         if (sidx < 0) die("T6", "virtual source vanished from input list");
         mm_device in_struct;
-        r = mm_in_open(&ctx, &in_struct, (uint32_t)sidx, on_struct, &g_struct);
-        if (r != MM_SUCCESS) die("T6", "mm_in_open (struct) failed");
-        r = mm_in_start(&in_struct);
-        if (r != MM_SUCCESS) die("T6", "mm_in_start (struct) failed");
+        if (mm_in_open(&rx, &in_struct, (uint32_t)sidx, on_struct, &g_struct) != MM_SUCCESS)
+            die("T6", "mm_in_open (struct) failed");
+        if (mm_in_start(&in_struct) != MM_SUCCESS) die("T6", "mm_in_start (struct) failed");
         usleep(200000);
 
         mm_message note;
@@ -308,7 +317,7 @@ int main(void) {
         if (mm_out_send(&src, &note) != MM_SUCCESS)
             die("T6", "mm_out_send (struct) returned error");
         if (!wait_for_struct(&g_struct, 1, WAIT_MS))
-            die("T6", "struct callback received nothing (shared read proc broken?)");
+            die("T6", "struct callback received nothing (shared path broken?)");
         mm_message got = g_struct.msgs[0];
         if (got.type != MM_NOTE_ON) die("T6", "struct decode wrong type");
         if (got.channel != 5 || got.data[0] != 0x40 || got.data[1] != 0x65)
@@ -319,10 +328,9 @@ int main(void) {
         mm_in_close(&in_struct);
     }
 
-    /* ── Teardown ── */
-    mm_in_stop(&in);
-    mm_in_close(&in);
+    /* ── Teardown ── (raw input `in` already closed before T6) ── */
     mm_out_close(&src);
-    mm_context_uninit(&ctx);
+    mm_context_uninit(&rx);
+    mm_context_uninit(&tx);
     return 0;
 }

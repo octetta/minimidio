@@ -494,6 +494,7 @@ typedef struct mm__dev_alsa {
     int            wake_pipe[2];   /* [0]=read [1]=write, used to unblock poll() */
     uint8_t        sysex_buf[MM_SYSEX_BUF_SIZE];
     size_t         sysex_pos;
+    snd_midi_event_t* midi_ev;     /* raw path: byte<->event coder (NULL otherwise) */
 } mm__dev_alsa;
 
 #elif defined(MM_BACKEND_WEBMIDI)
@@ -1414,7 +1415,7 @@ mm_result mm_context_uninit(mm_context* ctx) {
 }
 uint32_t mm_context_caps(mm_context* ctx) {
     (void)ctx;
-    uint32_t caps = MM_CAP_MIDI1 | MM_CAP_VIRTUAL_IN | MM_CAP_VIRTUAL_OUT;
+    uint32_t caps = MM_CAP_MIDI1 | MM_CAP_VIRTUAL_IN | MM_CAP_VIRTUAL_OUT | MM_CAP_RAW;
 #if MM_ALSA_HAS_UMP
     caps |= MM_CAP_UMP | MM_CAP_MIDI2;
 #endif
@@ -1555,6 +1556,45 @@ static void* mm__alsa_recv_thread(void* arg)
                 continue;
             }
 #endif
+            /* Raw mode: hand wire bytes to raw_callback, never dev->callback.
+               SysEx accumulates whole (mirrors the struct accumulator below);
+               every other event is turned back into bytes by ALSA's canonical
+               decoder — which yields a full status byte (no running-status
+               compression) and does NOT fold note-on-velocity-0 to note-off. */
+            if (dev->is_raw) {
+                snd_seq_event_t* ev = NULL;
+                int rc = snd_seq_event_input(al->seq, &ev);
+                if (rc == -EAGAIN || rc == -ENOSPC) break;
+                if (rc < 0 || !ev) break;
+
+                struct timespec rts; clock_gettime(CLOCK_MONOTONIC, &rts);
+                double rtsd = (double)rts.tv_sec + (double)rts.tv_nsec * 1e-9;
+
+                if (ev->type == SND_SEQ_EVENT_SYSEX) {
+                    uint8_t* d = (uint8_t*)ev->data.ext.ptr;
+                    size_t   n = ev->data.ext.len;
+                    if (n <= MM_SYSEX_BUF_SIZE - da->sysex_pos) {
+                        memcpy(da->sysex_buf + da->sysex_pos, d, n);
+                        da->sysex_pos += n;
+                        if (n > 0 && d[n-1] == 0xF7) {
+                            dev->raw_callback(dev, da->sysex_buf, da->sysex_pos,
+                                              rtsd, dev->userdata);
+                            da->sysex_pos = 0;
+                        }
+                    } else {
+                        da->sysex_pos = 0;  /* overflow — drop the runaway SysEx */
+                    }
+                } else {
+                    uint8_t buf[16];
+                    long n = snd_midi_event_decode(da->midi_ev, buf,
+                                                   (long)sizeof(buf), ev);
+                    if (n > 0)
+                        dev->raw_callback(dev, buf, (size_t)n, rtsd, dev->userdata);
+                    /* n <= 0: event has no wire-MIDI representation — skip */
+                }
+                continue;
+            }
+
             snd_seq_event_t* ev = NULL;
             int rc = snd_seq_event_input(al->seq, &ev);
             if (rc == -EAGAIN || rc == -ENOSPC) break; /* nothing left */
@@ -1746,15 +1786,68 @@ mm_result mm_in_open_ump(mm_context* ctx, mm_device* dev, uint32_t idx,
 #endif
 }
 
-/* Raw I/O is implemented for ALSA in a later slice; stub for now. */
+/* Raw input: mirrors mm_in_open but delivers wire bytes via raw_callback.
+   Allocates the byte<->event coder and disables running-status compression on
+   decode so each event yields a self-contained, full-status byte sequence.    */
 mm_result mm_in_open_raw(mm_context* ctx, mm_device* dev, uint32_t idx,
                          mm_raw_callback cb, void* ud)
-{ (void)ctx; (void)dev; (void)idx; (void)cb; (void)ud; return MM_NO_BACKEND; }
+{
+    if (!ctx||!ctx->initialized||!dev||!cb) return MM_INVALID_ARG;
+    mm__alsa_pl lst;
+    mm__alsa_enum(ctx, &lst,
+        SND_SEQ_PORT_CAP_READ|SND_SEQ_PORT_CAP_SUBS_READ,
+        SND_SEQ_PORT_CAP_READ);
+    if (idx >= lst.count) return MM_OUT_OF_RANGE;
+
+    memset(dev,0,sizeof(*dev));
+    dev->ctx=ctx; dev->raw_callback=cb; dev->is_raw=1; dev->userdata=ud; dev->is_input=1;
+    dev->al.target_client = lst.ports[idx].client;
+    dev->al.target_port   = lst.ports[idx].port;
+
+    if (snd_midi_event_new(MM_SYSEX_BUF_SIZE, &dev->al.midi_ev) < 0)
+        return MM_ALLOC_FAILED;
+    snd_midi_event_no_status(dev->al.midi_ev, 1);
+
+    if (pipe(dev->al.wake_pipe) != 0) {
+        snd_midi_event_free(dev->al.midi_ev); dev->al.midi_ev=NULL; return MM_ERROR;
+    }
+
+    char portname[80]; snprintf(portname, sizeof(portname), "%s-in", ctx->name);
+    dev->al.port_id = snd_seq_create_simple_port(ctx->al.seq, portname,
+        SND_SEQ_PORT_CAP_WRITE|SND_SEQ_PORT_CAP_SUBS_WRITE,
+        SND_SEQ_PORT_TYPE_APPLICATION);
+    if (dev->al.port_id < 0) {
+        close(dev->al.wake_pipe[0]); close(dev->al.wake_pipe[1]);
+        snd_midi_event_free(dev->al.midi_ev); dev->al.midi_ev=NULL; return MM_ERROR;
+    }
+    dev->is_open=1; return MM_SUCCESS;
+}
+
 mm_result mm_in_open_virtual_raw(mm_context* ctx, mm_device* dev,
                                  mm_raw_callback cb, void* ud)
-{ (void)ctx; (void)dev; (void)cb; (void)ud; return MM_NO_BACKEND; }
-mm_result mm_out_send_raw(mm_device* dev, const uint8_t* data, size_t len)
-{ (void)dev; (void)data; (void)len; return MM_NO_BACKEND; }
+{
+    if (!ctx||!ctx->initialized||!dev||!cb) return MM_INVALID_ARG;
+    memset(dev,0,sizeof(*dev));
+    dev->ctx=ctx; dev->raw_callback=cb; dev->is_raw=1; dev->userdata=ud;
+    dev->is_input=1; dev->is_virtual=1;
+
+    if (snd_midi_event_new(MM_SYSEX_BUF_SIZE, &dev->al.midi_ev) < 0)
+        return MM_ALLOC_FAILED;
+    snd_midi_event_no_status(dev->al.midi_ev, 1);
+
+    if (pipe(dev->al.wake_pipe) != 0) {
+        snd_midi_event_free(dev->al.midi_ev); dev->al.midi_ev=NULL; return MM_ERROR;
+    }
+
+    dev->al.port_id = snd_seq_create_simple_port(ctx->al.seq, ctx->name,
+        SND_SEQ_PORT_CAP_WRITE | SND_SEQ_PORT_CAP_SUBS_WRITE,
+        SND_SEQ_PORT_TYPE_APPLICATION | SND_SEQ_PORT_TYPE_MIDI_GENERIC);
+    if (dev->al.port_id < 0) {
+        close(dev->al.wake_pipe[0]); close(dev->al.wake_pipe[1]);
+        snd_midi_event_free(dev->al.midi_ev); dev->al.midi_ev=NULL; return MM_ERROR;
+    }
+    dev->is_open=1; return MM_SUCCESS;
+}
 
 mm_result mm_in_start(mm_device* dev) {
     if (!dev||!dev->is_open||!dev->is_input) return MM_NOT_OPEN;
@@ -1798,6 +1891,7 @@ mm_result mm_in_close(mm_device* dev) {
     if (dev->al.running) mm_in_stop(dev);
     close(dev->al.wake_pipe[0]); close(dev->al.wake_pipe[1]);
     snd_seq_delete_port(dev->ctx->al.seq, dev->al.port_id);
+    if (dev->al.midi_ev) { snd_midi_event_free(dev->al.midi_ev); dev->al.midi_ev=NULL; }
     dev->is_open=0; return MM_SUCCESS;
 }
 
@@ -1829,6 +1923,31 @@ static void mm__alsa_send_ev(mm_device* dev, snd_seq_event_t* ev) {
     snd_seq_ev_set_subs(ev);
     snd_seq_event_output(al->seq, ev);
     snd_seq_drain_output(al->seq);
+}
+
+/* Raw output: byte-exact, no cap. ALSA's encoder assembles channel/system
+   messages and a whole F0..F7 (one variable SysEx event) from the byte stream;
+   each produced event is sent through the existing send helper.                */
+mm_result mm_out_send_raw(mm_device* dev, const uint8_t* data, size_t len)
+{
+    if (!dev||!dev->is_open||dev->is_input) return MM_NOT_OPEN;
+    if (!data||!len) return MM_INVALID_ARG;
+    if (!dev->al.midi_ev) {
+        if (snd_midi_event_new(MM_SYSEX_BUF_SIZE, &dev->al.midi_ev) < 0)
+            return MM_ALLOC_FAILED;
+    }
+    snd_midi_event_reset_encode(dev->al.midi_ev);
+    size_t off = 0;
+    while (off < len) {
+        snd_seq_event_t ev; memset(&ev,0,sizeof(ev));
+        long used = snd_midi_event_encode(dev->al.midi_ev, data+off,
+                                          (long)(len-off), &ev);
+        if (used <= 0) break;          /* parser error / needs more bytes */
+        off += (size_t)used;
+        if (ev.type != SND_SEQ_EVENT_NONE)
+            mm__alsa_send_ev(dev, &ev);
+    }
+    return MM_SUCCESS;
 }
 
 mm_result mm_out_send(mm_device* dev, const mm_message* msg) {
@@ -1919,6 +2038,7 @@ mm_result mm_out_close(mm_device* dev) {
         snd_seq_disconnect_to(al->seq,dev->al.port_id,
                                    dev->al.target_client,dev->al.target_port);
     snd_seq_delete_port(al->seq,dev->al.port_id);
+    if (dev->al.midi_ev) { snd_midi_event_free(dev->al.midi_ev); dev->al.midi_ev=NULL; }
     dev->is_open=0; return MM_SUCCESS;
 }
 
