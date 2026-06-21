@@ -29,6 +29,9 @@ API through Emscripten.
 | Linux | ALSA sequencer | `-lasound -lpthread` |
 | Web / Emscripten | Web MIDI | `-sASYNCIFY` |
 
+Raw byte input/output is available on all current backends through
+`MM_CAP_RAW`. Raw virtual input follows virtual-port support, so it is
+available on macOS and Linux but returns `MM_NO_BACKEND` on WinMM and Web MIDI.
 MIDI 2.0 / UMP support is currently implemented for Linux ALSA builds with
 new enough ALSA sequencer UMP headers/runtime. Other backends keep the MIDI
 1.0 API and return `MM_NO_BACKEND` for raw UMP calls.
@@ -253,6 +256,7 @@ printf("Running as: %s\n", ctx.name);
 | `MM_CAP_MIDI2` | Backend can opt into MIDI 2.0 UMP mode |
 | `MM_CAP_VIRTUAL_IN` | Virtual MIDI input supported |
 | `MM_CAP_VIRTUAL_OUT` | Virtual MIDI output supported |
+| `MM_CAP_RAW` | Byte-transparent MIDI I/O |
 
 ### Enumeration
 
@@ -270,9 +274,13 @@ mm_result mm_in_open  (mm_context* ctx, mm_device* dev, uint32_t idx,
                        mm_callback cb, void* userdata);
 mm_result mm_in_open_ump(mm_context* ctx, mm_device* dev, uint32_t idx,
                          mm_ump_callback cb, void* userdata);
+mm_result mm_in_open_raw(mm_context* ctx, mm_device* dev, uint32_t idx,
+                         mm_raw_callback cb, void* userdata);
 mm_result mm_in_start (mm_device* dev);
 mm_result mm_in_stop  (mm_device* dev);
 mm_result mm_in_close (mm_device* dev);
+mm_result mm_in_open_virtual_raw(mm_context* ctx, mm_device* dev,
+                                 mm_raw_callback cb, void* userdata);
 ```
 
 Callbacks arrive on a **background thread**. Do not call `mm_in_stop` or
@@ -289,8 +297,49 @@ mm_result mm_out_open      (mm_context* ctx, mm_device* dev, uint32_t idx);
 mm_result mm_out_send      (mm_device* dev, const mm_message* msg);
 mm_result mm_out_send_ump  (mm_device* dev, const mm_ump_packet* pkt);
 mm_result mm_out_send_sysex(mm_device* dev, const uint8_t* data, size_t size);
+mm_result mm_out_send_raw  (mm_device* dev, const uint8_t* data, size_t len);
 mm_result mm_out_close     (mm_device* dev);
 ```
+
+### Raw MIDI bytes
+
+Use the raw byte API when you need the original MIDI 1.0 wire bytes instead
+of `mm_message` normalization:
+
+```c
+typedef void (*mm_raw_callback)(mm_device* dev,
+                                const uint8_t* data, size_t len,
+                                double timestamp, void* userdata);
+
+if (mm_context_caps(&ctx) & MM_CAP_RAW) {
+    mm_in_open_raw(&ctx, &dev, 0, on_raw, NULL);
+    mm_in_start(&dev);
+}
+
+if (mm_context_caps(&ctx) & MM_CAP_VIRTUAL_IN) {
+    mm_in_open_virtual_raw(&ctx, &virtual_in, on_raw, NULL);
+}
+
+uint8_t note_on[] = { 0x90, 60, 100 };
+mm_out_send_raw(&out, note_on, sizeof(note_on));
+```
+
+`mm_in_open_raw` opens the same input indices as `mm_in_open`, but each
+callback receives one complete byte message. It is byte-transparent: note-on
+with velocity 0 is not folded into note-off, status bytes are not normalized,
+large SysEx messages are delivered whole, and system real-time bytes are
+delivered as their own one-byte callbacks even when interleaved with SysEx.
+`mm_in_start`, `mm_in_stop`, and `mm_in_close` are shared with the normal input
+path.
+
+`mm_in_open_virtual_raw` is the byte-transparent twin of
+`mm_in_open_virtual`: it creates a named MIDI destination that other apps send
+into, then delivers those bytes to the raw callback. Like the normal virtual
+input API, it returns `MM_NO_BACKEND` on WinMM and Web MIDI.
+
+`mm_out_send_raw` sends the supplied bytes exactly as given through an opened
+output or virtual output. There is no fixed 256-byte SysEx cap in minimidio's
+raw path.
 
 ### MIDI 2.0 / UMP
 
@@ -571,8 +620,8 @@ the client name you registered with `mm_context_init`.
 The callback runs on a backend-managed background thread (CoreMIDI's run-loop
 thread, WinMM's callback thread, a `pthread` on Linux, or the browser event
 loop on Web MIDI). Protect any shared state with a mutex when using native
-threads. `mm_out_send` / `mm_out_send_sysex` are safe to call from the callback
-thread.
+threads. `mm_out_send`, `mm_out_send_sysex`, and `mm_out_send_raw` are safe to
+call from the callback thread.
 
 ---
 
@@ -635,10 +684,14 @@ so raw UMP calls return `MM_NO_BACKEND` there.
 ### v0.5.0-dev — MIDI 2.0 / UMP compatibility branch
 - **API: added raw UMP support** via `mm_ump_packet`, `mm_ump_callback`,
   `mm_in_open_ump`, and `mm_out_send_ump`.
+- **API: added raw byte-transparent MIDI support** via `MM_CAP_RAW`,
+  `mm_raw_callback`, `mm_in_open_raw`, `mm_in_open_virtual_raw`, and
+  `mm_out_send_raw`.
 - **API: added `mm_context_caps`** for backend feature discovery.
 - **ALSA: added MIDI 2.0/UMP path** using ALSA sequencer UMP APIs when
   available. Unsupported ALSA builds return `MM_NO_BACKEND` for UMP calls.
-- **Examples: added `examples/ump_monitor.c`** for raw UMP input monitoring.
+- **Examples: added `examples/raw_monitor.c` and `examples/ump_monitor.c`**
+  for raw byte and raw UMP input monitoring.
 - **Compatibility: existing MIDI 1.0 APIs remain unchanged**.
 
 ### v0.4.1 — bug fixes, no API changes

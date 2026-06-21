@@ -1,0 +1,136 @@
+/*
+  raw_monitor.c — list ports, open one for byte-transparent MIDI input
+
+  Build:
+    macOS:   cc raw_monitor.c -framework CoreMIDI -o raw_monitor
+    Windows: cl raw_monitor.c
+    Linux:   cc raw_monitor.c -lasound -lpthread -o raw_monitor
+    Web:     emcc raw_monitor.c -sASYNCIFY -o raw_monitor.html
+
+  Usage:
+    ./raw_monitor          -- opens input[0]
+    ./raw_monitor 2        -- opens input[2]
+
+  Raw byte input uses mm_in_open_raw and delivers one complete MIDI byte
+  message per callback without converting to mm_message.
+*/
+
+#define MINIMIDIO_IMPLEMENTATION
+#include "../minimidio.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+
+#ifdef _WIN32
+#  include <windows.h>
+#  define mm_sleep_ms(ms) Sleep(ms)
+#else
+#  include <unistd.h>
+#  define mm_sleep_ms(ms) usleep((ms) * 1000)
+#endif
+
+#include <signal.h>
+
+static volatile int g_running = 1;
+
+#ifdef _WIN32
+static BOOL WINAPI ctrl_handler(DWORD e) {
+    if (e == CTRL_C_EVENT || e == CTRL_BREAK_EVENT) {
+        g_running = 0;
+        return TRUE;
+    }
+    return FALSE;
+}
+static void setup_ctrl_c(void) { SetConsoleCtrlHandler(ctrl_handler, TRUE); }
+#else
+static void sig_handler(int s) { (void)s; g_running = 0; }
+static void setup_ctrl_c(void) {
+    signal(SIGINT, sig_handler);
+    signal(SIGTERM, sig_handler);
+}
+#endif
+
+static void on_raw(mm_device* dev, const uint8_t* data, size_t len,
+                   double timestamp, void* ud) {
+    (void)dev; (void)ud;
+
+    printf("[%8.3f] raw %zu byte%s:", timestamp, len, len == 1 ? "" : "s");
+    for (size_t i = 0; i < len; i++) {
+        printf(" %02X", data[i]);
+    }
+    printf("\n");
+    fflush(stdout);
+}
+
+int main(int argc, char* argv[]) {
+    uint32_t port_idx = 0;
+    if (argc > 1) port_idx = (uint32_t)atoi(argv[1]);
+
+    setup_ctrl_c();
+
+    mm_context ctx;
+    mm_result r = mm_context_init(&ctx, "raw-monitor");
+    if (r != MM_SUCCESS) {
+        fprintf(stderr, "mm_context_init: %s\n", mm_result_string(r));
+        return 1;
+    }
+
+    uint32_t caps = mm_context_caps(&ctx);
+    printf("Client name : \"%s\"\n", ctx.name);
+    printf("Capabilities: MIDI1=%s RAW=%s UMP=%s MIDI2=%s\n\n",
+           (caps & MM_CAP_MIDI1) ? "yes" : "no",
+           (caps & MM_CAP_RAW) ? "yes" : "no",
+           (caps & MM_CAP_UMP) ? "yes" : "no",
+           (caps & MM_CAP_MIDI2) ? "yes" : "no");
+
+    if ((caps & MM_CAP_RAW) == 0) {
+        fprintf(stderr, "This backend does not advertise MM_CAP_RAW.\n");
+        mm_context_uninit(&ctx);
+        return 1;
+    }
+
+    uint32_t count = mm_in_count(&ctx);
+    printf("MIDI Inputs:\n");
+    for (uint32_t i = 0; i < count; i++) {
+        char name[256];
+        mm_in_name(&ctx, i, name, sizeof(name));
+        printf("  [%u] %s%s\n", i, name, i == port_idx ? "  <-- will open" : "");
+    }
+    if (count == 0) {
+        printf("  (none)\n");
+        mm_context_uninit(&ctx);
+        return 0;
+    }
+
+    if (port_idx >= count) {
+        fprintf(stderr, "\nPort index %u out of range (0..%u)\n",
+                port_idx, count - 1);
+        mm_context_uninit(&ctx);
+        return 1;
+    }
+
+    mm_device dev;
+    r = mm_in_open_raw(&ctx, &dev, port_idx, on_raw, NULL);
+    if (r != MM_SUCCESS) {
+        fprintf(stderr, "mm_in_open_raw: %s\n", mm_result_string(r));
+        mm_context_uninit(&ctx);
+        return 1;
+    }
+
+    r = mm_in_start(&dev);
+    if (r != MM_SUCCESS) {
+        fprintf(stderr, "mm_in_start: %s\n", mm_result_string(r));
+        mm_in_close(&dev);
+        mm_context_uninit(&ctx);
+        return 1;
+    }
+
+    printf("\nListening for raw MIDI input[%u]. Press Ctrl-C to stop.\n", port_idx);
+    while (g_running) mm_sleep_ms(100);
+
+    printf("\nStopping...\n");
+    mm_in_stop(&dev);
+    mm_in_close(&dev);
+    mm_context_uninit(&ctx);
+    return 0;
+}
